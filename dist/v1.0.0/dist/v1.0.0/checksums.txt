@@ -1,0 +1,4 @@
+62d3daf9d2d705f9426acb43adb7369793a8217cd25c5348776f6dec4c796802  gorly-ops-darwin-amd64
+7781de1a82de26edc9649d1cb5d5d6e5ad6f4de715aad5d88c47e5f28bb299d4  gorly-ops-darwin-arm64
+e481419aaf6e6c8c2efa1d43ddc6c6c9eaf6b1e2dc779d9bd63628aaae493bcc  gorly-ops-linux-amd64
+aa555676e8f0a43f0b3c0508a3c38d7413348588234339ca8d3864e9bd633f4f  gorly-ops-windows-amd64.exe
