@@ -1,0 +1,43 @@
+# docker-compose.yml - Podman compatible
+version: '3.8'
+
+services:
+  redis:
+    image: docker.io/redis:7-alpine
+    container_name: gorly-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - gorly-network
+
+  redis-commander:
+    image: docker.io/rediscommander/redis-commander:latest
+    container_name: gorly-redis-commander
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - gorly-network
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  gorly-network:
+    driver: bridge

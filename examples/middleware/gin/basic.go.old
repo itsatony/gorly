@@ -1,0 +1,79 @@
+// examples/middleware/gin/basic.go
+package main
+
+import (
+	"log"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	ratelimit "github.com/itsatony/gorly"
+	"github.com/itsatony/gorly/middleware"
+)
+
+func main() {
+	// Create rate limiter configuration
+	config := ratelimit.DefaultConfig()
+	config.Store = "memory" // Use Redis in production
+
+	// Create rate limiter
+	limiter, err := ratelimit.NewRateLimiter(config)
+	if err != nil {
+		log.Fatal("Failed to create rate limiter:", err)
+	}
+	defer limiter.Close()
+
+	// Create Gin router
+	r := gin.Default()
+
+	// Method 1: Use convenience function with default config
+	r.Use(middleware.GinMiddleware(limiter))
+
+	// Method 2: Use plugin system directly (alternative)
+	// plugin, _ := middleware.Get("gin")
+	// ginMiddleware := plugin.CreateMiddleware(limiter, middleware.DefaultConfig())
+	// r.Use(ginMiddleware.(gin.HandlerFunc))
+
+	// Define routes
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"message": "Hello World!"})
+	})
+
+	r.GET("/api/users", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"users": []string{"alice", "bob"}})
+	})
+
+	r.POST("/api/users", func(c *gin.Context) {
+		c.JSON(http.StatusCreated, gin.H{"message": "User created"})
+	})
+
+	// Route to test rate limit info in context
+	r.GET("/api/status", func(c *gin.Context) {
+		// Rate limit info is automatically added to context
+		result, exists := c.Get("ratelimit_result")
+		if exists {
+			rlResult := result.(*ratelimit.Result)
+			c.JSON(http.StatusOK, gin.H{
+				"rate_limit": gin.H{
+					"allowed":   rlResult.Allowed,
+					"remaining": rlResult.Remaining,
+					"limit":     rlResult.Limit,
+					"window":    rlResult.Window.String(),
+				},
+			})
+		} else {
+			c.JSON(http.StatusOK, gin.H{"message": "Rate limiting not active"})
+		}
+	})
+
+	log.Println("Starting server on :8080")
+	log.Println("Try these endpoints:")
+	log.Println("  GET  http://localhost:8080/")
+	log.Println("  GET  http://localhost:8080/api/users")
+	log.Println("  POST http://localhost:8080/api/users")
+	log.Println("  GET  http://localhost:8080/api/status")
+	log.Println("")
+	log.Println("Rate limit headers will be included in responses.")
+	log.Println("Default limit: 100 requests per hour per IP address.")
+
+	r.Run(":8080")
+}

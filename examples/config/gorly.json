@@ -1,0 +1,75 @@
+{
+  "enabled": true,
+  "algorithm": "token_bucket",
+  "store": "memory",
+  "keyPrefix": "gorly_dev:",
+  "enableMetrics": true,
+  "metricsPrefix": "gorly_dev_",
+  "operationTimeout": "3s",
+  "maxConcurrentRequests": 500,
+  
+  "redis": {
+    "address": "localhost:6379",
+    "password": "",
+    "database": 0,
+    "poolSize": 10,
+    "minIdleConn": 3,
+    "maxRetries": 3,
+    "timeout": "3s",
+    "tls": false
+  },
+  
+  "defaultLimits": {
+    "global": "500/1h",
+    "memory": "50/1m",
+    "search": "25/1m",
+    "metadata": "100/1m"
+  },
+  
+  "scopeLimits": {
+    "search": {
+      "requests": 10,
+      "window": "60s"
+    }
+  },
+  
+  "tierLimits": {
+    "free": {
+      "defaultLimits": {
+        "global": "50/1h",
+        "memory": "10/1m",
+        "search": "5/1m"
+      }
+    },
+    "pro": {
+      "defaultLimits": {
+        "global": "2000/1h",
+        "memory": "200/1m",
+        "search": "50/1m"
+      }
+    }
+  },
+  
+  "entityOverrides": {
+    "user:test_user": {
+      "enabled": true,
+      "limits": {
+        "global": "1000/1h"
+      },
+      "metadata": {
+        "environment": "development"
+      }
+    },
+    "apikey:development": {
+      "enabled": true,
+      "algorithm": "token_bucket",
+      "limits": {
+        "global": "100/1m",
+        "search": "20/1m"
+      },
+      "metadata": {
+        "type": "development_key"
+      }
+    }
+  }
+}

@@ -1,0 +1,306 @@
+// examples/middleware/echo/advanced.go
+package main
+
+import (
+	"log"
+	"net/http"
+	"strings"
+
+	"github.com/labstack/echo/v4"
+	ratelimit "github.com/itsatony/gorly"
+	"github.com/itsatony/gorly/middleware"
+)
+
+func mainAdvanced() {
+	// Create advanced rate limiter configuration
+	config := ratelimit.DefaultConfig()
+	config.Store = "memory"
+
+	// Configure different limits for different scopes
+	config.ScopeLimits = map[string]ratelimit.RateLimit{
+		"read":      {Requests: 1000, Window: "1h"},
+		"write":     {Requests: 100, Window: "1h"},
+		"upload":    {Requests: 10, Window: "1h"},
+		"admin":     {Requests: 50, Window: "1h"},
+		"analytics": {Requests: 200, Window: "1h"},
+	}
+
+	// Configure tier-specific limits with path-based detection
+	config.TierLimits = map[string]ratelimit.TierConfig{
+		ratelimit.TierFree: {
+			Limits: map[string]ratelimit.RateLimit{
+				ratelimit.ScopeGlobal: {Requests: 100, Window: "1h"},
+				"read":                {Requests: 50, Window: "1h"},
+				"write":               {Requests: 10, Window: "1h"},
+			},
+		},
+		ratelimit.TierPremium: {
+			Limits: map[string]ratelimit.RateLimit{
+				ratelimit.ScopeGlobal: {Requests: 10000, Window: "1h"},
+				"read":                {Requests: 5000, Window: "1h"},
+				"write":               {Requests: 1000, Window: "1h"},
+			},
+		},
+	}
+
+	// Create rate limiter
+	limiter, err := ratelimit.NewRateLimiter(config)
+	if err != nil {
+		log.Fatal("Failed to create rate limiter:", err)
+	}
+	defer limiter.Close()
+
+	// Create advanced middleware configuration
+	middlewareConfig := &middleware.Config{
+		Limiter: limiter,
+
+		// Custom entity extractor with Echo-specific headers
+		EntityExtractor: &middleware.DefaultEntityExtractor{
+			APIKeyHeaders: []string{"Authorization", "X-API-Key", "X-Api-Key"},
+			UserIDHeaders: []string{"X-User-ID", "X-User-Id", "X-Subject"},
+			UseIPFallback: true,
+		},
+
+		// Echo-optimized scope extractor
+		ScopeExtractor: &middleware.DefaultScopeExtractor{
+			PathScopes: map[string]string{
+				"/api/admin":     "admin",
+				"/api/upload":    "upload",
+				"/api/search":    ratelimit.ScopeSearch,
+				"/api/reports":   "analytics",
+				"/api/analytics": "analytics",
+			},
+			MethodScopes: map[string]string{
+				"GET":    "read",
+				"HEAD":   "read",
+				"POST":   "write",
+				"PUT":    "write",
+				"PATCH":  "write",
+				"DELETE": "write",
+			},
+			DefaultScope: ratelimit.ScopeGlobal,
+		},
+
+		// Path-based tier extraction (Echo specialty)
+		TierExtractor: middleware.EchoPathBasedTierExtractor(),
+
+		// Skip functions for Echo
+		SkipFunc: middleware.CombineSkipFuncs(
+			middleware.EchoSkipHealthChecks(),
+			middleware.EchoSkipByRoute("/health", "/metrics", "/debug"),
+			middleware.EchoSkipByUserAgent("HealthChecker", "StatusPage"),
+		),
+
+		// Enhanced response configuration
+		ResponseConfig: middleware.ResponseConfig{
+			RateLimitedStatusCode: 429,
+			ErrorStatusCode:       500,
+			IncludeHeaders:        true,
+			HeaderPrefix:          "X-RateLimit-",
+			ContentType:           "application/json",
+			RateLimitedResponse:   []byte(`{"error":"Rate limit exceeded","code":"RATE_LIMIT_EXCEEDED","retry_after_seconds":3600}`),
+			ErrorResponse:         []byte(`{"error":"Rate limiting service error","code":"SERVICE_ERROR"}`),
+		},
+
+		// Custom error handler
+		ErrorHandler: func(req *middleware.RequestInfo, err error) bool {
+			log.Printf("Rate limiting error for %s %s: %v", req.Method, req.Path, err)
+			return false
+		},
+
+		// Custom logger
+		Logger: &ConsoleLogger{},
+
+		// Enable metrics
+		MetricsEnabled: true,
+		MetricsPrefix:  "echo_api_",
+	}
+
+	// Create Echo instance
+	e := echo.New()
+
+	// Use advanced middleware
+	plugin := &middleware.EchoPlugin{}
+	echoMiddleware := plugin.CreateMiddleware(limiter, middlewareConfig)
+	e.Use(echoMiddleware.(echo.MiddlewareFunc))
+
+	// Health check endpoint (will be skipped)
+	e.GET("/health", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"status": "healthy"})
+	})
+
+	// Admin routes (admin scope)
+	adminGroup := e.Group("/api/admin")
+	adminGroup.GET("/stats", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"admin": "stats"})
+	})
+	adminGroup.POST("/config", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"admin": "config updated"})
+	})
+
+	// Upload routes (upload scope)
+	e.POST("/api/upload", func(c echo.Context) error {
+		return c.JSON(http.StatusCreated, map[string]string{"message": "File uploaded"})
+	})
+
+	// Search routes (search scope)
+	e.GET("/api/search", func(c echo.Context) error {
+		query := c.QueryParam("q")
+		return c.JSON(http.StatusOK, map[string]interface{}{
+			"query":   query,
+			"results": []string{},
+		})
+	})
+
+	// Analytics routes (analytics scope)
+	analyticsGroup := e.Group("/api/analytics")
+	analyticsGroup.GET("/reports", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"report": "data"})
+	})
+	analyticsGroup.GET("/metrics", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"metrics": "data"})
+	})
+
+	// Regular API routes with path parameters (showcasing Echo's route matching)
+	apiGroup := e.Group("/api")
+
+	// Users API with path parameters
+	apiGroup.GET("/users", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string][]string{
+			"users": {"alice", "bob", "charlie"},
+		})
+	})
+
+	apiGroup.POST("/users", func(c echo.Context) error {
+		return c.JSON(http.StatusCreated, map[string]string{
+			"message": "User created",
+		})
+	})
+
+	apiGroup.GET("/users/:id", func(c echo.Context) error {
+		id := c.Param("id")
+		return c.JSON(http.StatusOK, map[string]interface{}{
+			"user": map[string]string{
+				"id":   id,
+				"name": "User " + id,
+			},
+		})
+	})
+
+	apiGroup.PUT("/users/:id", func(c echo.Context) error {
+		id := c.Param("id")
+		return c.JSON(http.StatusOK, map[string]string{
+			"message": "User " + id + " updated",
+		})
+	})
+
+	// Tier-based routes (demonstrating path-based tier detection)
+	e.GET("/api/v1/free/*", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{
+			"tier":    "free",
+			"message": "Free tier endpoint",
+		})
+	})
+
+	e.GET("/api/v1/premium/*", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{
+			"tier":    "premium", 
+			"message": "Premium tier endpoint",
+		})
+	})
+
+	// Content-Type based scope extraction demo
+	e.POST("/api/data", func(c echo.Context) error {
+		contentType := c.Request().Header.Get("Content-Type")
+		return c.JSON(http.StatusOK, map[string]string{
+			"message":      "Data processed",
+			"content_type": contentType,
+		})
+	})
+
+	// Route to show detailed rate limit status
+	e.GET("/api/rate-limit-status", func(c echo.Context) error {
+		result := c.Get("ratelimit_result")
+		entityID := c.Get("ratelimit_entity_id")
+		scope := c.Get("ratelimit_scope")
+
+		if result == nil {
+			return c.JSON(http.StatusOK, map[string]string{
+				"message": "Rate limiting not active",
+			})
+		}
+
+		rlResult := result.(*ratelimit.Result)
+		return c.JSON(http.StatusOK, map[string]interface{}{
+			"entity_id": entityID,
+			"scope":     scope,
+			"route":     c.Path(),
+			"params":    c.ParamNames(),
+			"rate_limit": map[string]interface{}{
+				"allowed":    rlResult.Allowed,
+				"remaining":  rlResult.Remaining,
+				"limit":      rlResult.Limit,
+				"used":       rlResult.Used,
+				"window":     rlResult.Window.String(),
+				"algorithm":  rlResult.Algorithm,
+				"reset_time": rlResult.ResetTime,
+			},
+		})
+	})
+
+	log.Println("Starting advanced Echo server on :8080")
+	log.Println("")
+	log.Println("Try these endpoints with different configurations:")
+	log.Println("")
+	log.Println("# Basic requests (IP-based, free tier)")
+	log.Println("curl http://localhost:8080/api/users")
+	log.Println("curl http://localhost:8080/api/users/123")
+	log.Println("")
+	log.Println("# With API key and tier headers")
+	log.Println("curl -H 'X-API-Key: premium-key' -H 'X-User-Tier: premium' http://localhost:8080/api/users")
+	log.Println("")
+	log.Println("# Different scopes")
+	log.Println("curl http://localhost:8080/api/search?q=test          # search scope")
+	log.Println("curl -X POST http://localhost:8080/api/upload        # upload scope")
+	log.Println("curl http://localhost:8080/api/admin/stats           # admin scope")
+	log.Println("curl http://localhost:8080/api/analytics/reports     # analytics scope")
+	log.Println("")
+	log.Println("# Path-based tier detection")
+	log.Println("curl http://localhost:8080/api/v1/free/endpoint      # free tier")
+	log.Println("curl http://localhost:8080/api/v1/premium/endpoint   # premium tier")
+	log.Println("")
+	log.Println("# Content-Type based scope")
+	log.Println("curl -X POST -H 'Content-Type: application/json' -d '{}' http://localhost:8080/api/data")
+	log.Println("curl -X POST -H 'Content-Type: multipart/form-data' http://localhost:8080/api/data")
+	log.Println("")
+	log.Println("# Check detailed status")
+	log.Println("curl http://localhost:8080/api/rate-limit-status")
+	log.Println("")
+	log.Println("Rate limits by scope:")
+	log.Println("  - read:      1000/hour")
+	log.Println("  - write:     100/hour")
+	log.Println("  - upload:    10/hour")
+	log.Println("  - admin:     50/hour")
+	log.Println("  - analytics: 200/hour")
+
+	e.Logger.Fatal(e.Start(":8080"))
+}
+
+// ConsoleLogger implements the Logger interface for console output
+type ConsoleLogger struct{}
+
+func (l *ConsoleLogger) Info(msg string, fields map[string]interface{}) {
+	log.Printf("[INFO] %s: %+v", msg, fields)
+}
+
+func (l *ConsoleLogger) Warn(msg string, fields map[string]interface{}) {
+	log.Printf("[WARN] %s: %+v", msg, fields)
+}
+
+func (l *ConsoleLogger) Error(msg string, err error, fields map[string]interface{}) {
+	log.Printf("[ERROR] %s: %v, fields: %+v", msg, err, fields)
+}
+
+func (l *ConsoleLogger) Debug(msg string, fields map[string]interface{}) {
+	log.Printf("[DEBUG] %s: %+v", msg, fields)
+}

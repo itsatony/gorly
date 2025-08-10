@@ -1,0 +1,244 @@
+// examples/middleware/gin/advanced.go
+package main
+
+import (
+	"log"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	ratelimit "github.com/itsatony/gorly"
+	"github.com/itsatony/gorly/middleware"
+)
+
+func mainAdvanced() {
+	// Create advanced rate limiter configuration
+	config := ratelimit.DefaultConfig()
+	config.Store = "memory"
+
+	// Configure different limits for different scopes
+	config.ScopeLimits = map[string]ratelimit.RateLimit{
+		"read":   {Requests: 1000, Window: "1h"},
+		"write":  {Requests: 100, Window: "1h"},
+		"upload": {Requests: 10, Window: "1h"},
+		"admin":  {Requests: 50, Window: "1h"},
+	}
+
+	// Configure tier-specific limits
+	config.TierLimits = map[string]ratelimit.TierConfig{
+		ratelimit.TierFree: {
+			Limits: map[string]ratelimit.RateLimit{
+				ratelimit.ScopeGlobal: {Requests: 100, Window: "1h"},
+				"read":                {Requests: 50, Window: "1h"},
+				"write":               {Requests: 10, Window: "1h"},
+			},
+		},
+		ratelimit.TierPremium: {
+			Limits: map[string]ratelimit.RateLimit{
+				ratelimit.ScopeGlobal: {Requests: 10000, Window: "1h"},
+				"read":                {Requests: 5000, Window: "1h"},
+				"write":               {Requests: 1000, Window: "1h"},
+			},
+		},
+	}
+
+	// Create rate limiter
+	limiter, err := ratelimit.NewRateLimiter(config)
+	if err != nil {
+		log.Fatal("Failed to create rate limiter:", err)
+	}
+	defer limiter.Close()
+
+	// Create advanced middleware configuration
+	middlewareConfig := &middleware.Config{
+		Limiter: limiter,
+
+		// Custom entity extractor that prioritizes API keys over IP
+		EntityExtractor: &middleware.DefaultEntityExtractor{
+			APIKeyHeaders: []string{"Authorization", "X-API-Key", "X-Api-Key"},
+			UserIDHeaders: []string{"X-User-ID", "X-User-Id"},
+			UseIPFallback: true,
+		},
+
+		// Custom scope extractor based on routes and methods
+		ScopeExtractor: &middleware.DefaultScopeExtractor{
+			PathScopes: map[string]string{
+				"/api/admin":   "admin",
+				"/api/upload":  "upload",
+				"/api/search":  "search",
+				"/api/reports": "analytics",
+			},
+			MethodScopes: map[string]string{
+				"GET":    "read",
+				"HEAD":   "read",
+				"POST":   "write",
+				"PUT":    "write",
+				"PATCH":  "write",
+				"DELETE": "write",
+			},
+			DefaultScope: ratelimit.ScopeGlobal,
+		},
+
+		// Custom tier extractor from headers
+		TierExtractor: &middleware.DefaultTierExtractor{
+			TierHeaders: []string{"X-User-Tier", "X-Subscription-Level"},
+			DefaultTier: ratelimit.TierFree,
+		},
+
+		// Skip functions for common cases
+		SkipFunc: middleware.CombineSkipFuncs(
+			middleware.GinSkipHealthChecks(),
+			middleware.GinSkipOptions(),
+			middleware.GinSkipStatic(),
+		),
+
+		// Enhanced response configuration
+		ResponseConfig: middleware.ResponseConfig{
+			RateLimitedStatusCode: 429,
+			ErrorStatusCode:       500,
+			IncludeHeaders:        true,
+			HeaderPrefix:          "X-RateLimit-",
+			ContentType:           "application/json",
+			RateLimitedResponse:   []byte(`{"error":"Rate limit exceeded","code":"RATE_LIMIT_EXCEEDED","details":"Please wait before making more requests"}`),
+			ErrorResponse:         []byte(`{"error":"Rate limiting service unavailable","code":"SERVICE_ERROR"}`),
+		},
+
+		// Custom error handler
+		ErrorHandler: func(req *middleware.RequestInfo, err error) bool {
+			log.Printf("Rate limiting error for %s %s: %v", req.Method, req.Path, err)
+			// Return false to stop request processing
+			return false
+		},
+
+		// Enable logging
+		Logger: &middleware.ConsoleLogger{},
+
+		// Enable metrics
+		MetricsEnabled: true,
+		MetricsPrefix:  "gin_api_",
+	}
+
+	// Create Gin router
+	r := gin.Default()
+
+	// Use custom middleware configuration
+	plugin := &middleware.GinPlugin{}
+	ginMiddleware := plugin.CreateMiddleware(limiter, middlewareConfig)
+	r.Use(ginMiddleware.(gin.HandlerFunc))
+
+	// Define routes with different scopes
+	
+	// Health check (will be skipped)
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "healthy"})
+	})
+
+	// Admin routes (admin scope)
+	admin := r.Group("/api/admin")
+	{
+		admin.GET("/stats", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"admin": "stats"})
+		})
+		admin.POST("/config", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"admin": "config updated"})
+		})
+	}
+
+	// Upload routes (upload scope)
+	r.POST("/api/upload", func(c *gin.Context) {
+		c.JSON(http.StatusCreated, gin.H{"message": "File uploaded"})
+	})
+
+	// Search routes (search scope)  
+	r.GET("/api/search", func(c *gin.Context) {
+		query := c.Query("q")
+		c.JSON(http.StatusOK, gin.H{"query": query, "results": []string{}})
+	})
+
+	// Regular API routes (read/write scopes based on method)
+	api := r.Group("/api")
+	{
+		api.GET("/users", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"users": []string{"alice", "bob"}})
+		})
+		
+		api.POST("/users", func(c *gin.Context) {
+			c.JSON(http.StatusCreated, gin.H{"message": "User created"})
+		})
+
+		api.PUT("/users/:id", func(c *gin.Context) {
+			id := c.Param("id")
+			c.JSON(http.StatusOK, gin.H{"message": "User " + id + " updated"})
+		})
+	}
+
+	// Route to show current rate limit status
+	r.GET("/api/rate-limit-status", func(c *gin.Context) {
+		result, _ := c.Get("ratelimit_result")
+		entityID, _ := c.Get("ratelimit_entity_id")
+		scope, _ := c.Get("ratelimit_scope")
+
+		rlResult := result.(*ratelimit.Result)
+		c.JSON(http.StatusOK, gin.H{
+			"entity_id": entityID,
+			"scope":     scope,
+			"rate_limit": gin.H{
+				"allowed":    rlResult.Allowed,
+				"remaining":  rlResult.Remaining,
+				"limit":      rlResult.Limit,
+				"used":       rlResult.Used,
+				"window":     rlResult.Window.String(),
+				"algorithm":  rlResult.Algorithm,
+				"reset_time": rlResult.ResetTime,
+			},
+		})
+	})
+
+	log.Println("Starting advanced Gin server on :8080")
+	log.Println("")
+	log.Println("Try these endpoints with different headers:")
+	log.Println("  # No auth (IP-based, free tier)")
+	log.Println("  curl http://localhost:8080/api/users")
+	log.Println("")
+	log.Println("  # With API key (premium tier)")
+	log.Println("  curl -H 'X-API-Key: premium-key-123' http://localhost:8080/api/users")
+	log.Println("  curl -H 'X-User-Tier: premium' http://localhost:8080/api/users")
+	log.Println("")
+	log.Println("  # Different scopes")
+	log.Println("  curl http://localhost:8080/api/search?q=test      # search scope")
+	log.Println("  curl -X POST http://localhost:8080/api/upload    # upload scope") 
+	log.Println("  curl http://localhost:8080/api/admin/stats       # admin scope")
+	log.Println("")
+	log.Println("  # Check rate limit status")
+	log.Println("  curl http://localhost:8080/api/rate-limit-status")
+	log.Println("")
+	log.Println("Rate limits by scope:")
+	log.Println("  - read:   1000/hour")
+	log.Println("  - write:  100/hour") 
+	log.Println("  - upload: 10/hour")
+	log.Println("  - admin:  50/hour")
+	log.Println("")
+	log.Println("Tier multipliers:")
+	log.Println("  - free:    100/hour global limit")
+	log.Println("  - premium: 10,000/hour global limit")
+
+	r.Run(":8080")
+}
+
+// ConsoleLogger implements the Logger interface for console output
+type ConsoleLogger struct{}
+
+func (l *ConsoleLogger) Info(msg string, fields map[string]interface{}) {
+	log.Printf("[INFO] %s: %+v", msg, fields)
+}
+
+func (l *ConsoleLogger) Warn(msg string, fields map[string]interface{}) {
+	log.Printf("[WARN] %s: %+v", msg, fields)
+}
+
+func (l *ConsoleLogger) Error(msg string, err error, fields map[string]interface{}) {
+	log.Printf("[ERROR] %s: %v, fields: %+v", msg, err, fields)
+}
+
+func (l *ConsoleLogger) Debug(msg string, fields map[string]interface{}) {
+	log.Printf("[DEBUG] %s: %+v", msg, fields)
+}

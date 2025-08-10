@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - redis-data:/data
+
+  gorly-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - GO_ENV=test
+    volumes:
+      - .:/app
+      - /app/vendor
+    working_dir: /app
+    command: make test
+    
+  gorly-integration-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - GO_ENV=integration
+    volumes:
+      - .:/app
+      - /app/vendor
+    working_dir: /app
+    command: make test-integration
+
+  gorly-bench:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - GO_ENV=benchmark
+    volumes:
+      - .:/app
+      - /app/vendor
+    working_dir: /app
+    command: make bench
+
+volumes:
+  redis-data:

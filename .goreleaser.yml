@@ -1,0 +1,159 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - go mod download
+
+builds:
+  - id: gorly
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - "386"
+      - amd64
+      - arm
+      - arm64
+    goarm:
+      - "7"
+    ignore:
+      - goos: windows
+        goarch: arm
+      - goos: windows
+        goarch: arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+    binary: gorly
+    main: ./cmd/gorly
+
+archives:
+  - id: gorly
+    builds:
+      - gorly
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+      - "^style:"
+      - "^refactor:"
+      - Merge pull request
+      - Merge branch
+  groups:
+    - title: Features
+      regexp: "^.*feat[(\\w)]*:+.*$"
+      order: 0
+    - title: 'Bug fixes'
+      regexp: "^.*fix[(\\w)]*:+.*$"
+      order: 1
+    - title: Others
+      order: 999
+
+dockers:
+  - image_templates:
+      - "ghcr.io/itsatony/gorly:{{ .Version }}-amd64"
+      - "ghcr.io/itsatony/gorly:latest-amd64"
+    dockerfile: Dockerfile
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+  - image_templates:
+      - "ghcr.io/itsatony/gorly:{{ .Version }}-arm64"
+      - "ghcr.io/itsatony/gorly:latest-arm64"
+    goarch: arm64
+    dockerfile: Dockerfile
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+
+docker_manifests:
+  - name_template: "ghcr.io/itsatony/gorly:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/itsatony/gorly:{{ .Version }}-amd64"
+      - "ghcr.io/itsatony/gorly:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/itsatony/gorly:latest"
+    image_templates:
+      - "ghcr.io/itsatony/gorly:latest-amd64"
+      - "ghcr.io/itsatony/gorly:latest-arm64"
+
+release:
+  github:
+    owner: itsatony
+    name: gorly
+  draft: false
+  prerelease: auto
+  name_template: "{{.ProjectName}}-v{{.Version}}"
+  header: |
+    ## Gorly Rate Limiting Library v{{ .Version }}
+    
+    This release includes improvements to the rate limiting algorithms and overall stability.
+    
+    ### Installation
+    
+    ```bash
+    go get github.com/itsatony/gorly@{{ .Tag }}
+    ```
+    
+  footer: |
+    ## Docker Images
+    
+    Docker images are available for multiple architectures:
+    
+    ```bash
+    docker pull ghcr.io/itsatony/gorly:{{ .Version }}
+    ```
+    
+    **Full Changelog**: https://github.com/itsatony/gorly/compare/{{ .PreviousTag }}...{{ .Tag }}
+
+  extra_files:
+    - glob: ./coverage.html
+    - glob: ./docs/*.md
+
+brews:
+  - name: gorly
+    repository:
+      owner: itsatony
+      name: homebrew-gorly
+      branch: main
+    folder: Formula
+    homepage: "https://github.com/itsatony/gorly"
+    description: "High-performance, Redis-backed rate limiting library for Go applications"
+    license: "MIT"
+    test: |
+      system "#{bin}/gorly --version"
+    install: |
+      bin.install "gorly"
+
+milestones:
+  - close: true
+    fail_on_error: false
+    name_template: "{{ .Tag }}"

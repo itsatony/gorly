@@ -1,0 +1,88 @@
+# Example Gorly Configuration File (YAML)
+# This demonstrates all available configuration options
+
+# Basic settings
+enabled: true                    # Enable/disable rate limiting globally
+algorithm: "sliding_window"      # Algorithm: "token_bucket", "sliding_window", "gcra"
+store: "redis"                   # Storage backend: "memory", "redis"
+keyPrefix: "gorly:"             # Key prefix for all stored data
+enableMetrics: true             # Enable Prometheus metrics collection
+metricsPrefix: "gorly_"         # Prefix for metric names
+operationTimeout: "5s"          # Timeout for rate limit operations
+maxConcurrentRequests: 1000     # Maximum concurrent rate limit checks
+
+# Redis configuration (used when store: "redis")
+redis:
+  address: "localhost:6379"     # Redis server address
+  password: ""                  # Redis password (if required)
+  database: 0                   # Redis database number
+  poolSize: 10                  # Connection pool size
+  minIdleConn: 5                # Minimum idle connections
+  maxRetries: 3                 # Maximum retry attempts
+  timeout: "3s"                 # Connection timeout
+  tls: false                    # Enable TLS/SSL
+
+# Default rate limits (applied to all entities unless overridden)
+defaultLimits:
+  global: "1000/1h"           # 1000 requests per hour globally
+  memory: "100/1m"             # 100 memory operations per minute
+  search: "50/1m"              # 50 search operations per minute
+  metadata: "200/1m"           # 200 metadata operations per minute
+
+# Scope-specific limits (override defaults for specific scopes)
+scopeLimits:
+  search:
+    requests: 25                # 25 requests
+    window: "30s"               # per 30 seconds
+
+# Tier-based limits (different limits for different user tiers)
+tierLimits:
+  free:
+    defaultLimits:
+      global: "100/1h"
+      memory: "20/1m"
+      search: "10/1m"
+      metadata: "30/1m"
+    scopeLimits:
+      search: "5/1m"
+  
+  pro:
+    defaultLimits:
+      global: "5000/1h"
+      memory: "500/1m"
+      search: "100/1m"
+      metadata: "500/1m"
+    scopeLimits:
+      search: "50/1m"
+  
+  enterprise:
+    defaultLimits:
+      global: "50000/1h"
+      memory: "5000/1m"
+      search: "1000/1m"
+      metadata: "5000/1m"
+    scopeLimits:
+      search: "500/1m"
+
+# Entity-specific overrides (for specific users, API keys, etc.)
+entityOverrides:
+  "user:vip_user_123":          # Specific user override
+    enabled: true
+    algorithm: "sliding_window" # Override algorithm for this user
+    limits:
+      global: "10000/1h"
+      memory: "1000/1m"
+    metadata:
+      tier: "vip"
+      notes: "High-value customer"
+  
+  "apikey:special_integration": # Specific API key override
+    enabled: true
+    limits:
+      global: "25000/1h"
+      search: "2000/1m"
+    metadata:
+      integration: "partner_system"
+  
+  "ip:192.168.1.100":          # Specific IP override (backward compatibility)
+    global: "200/1h"
