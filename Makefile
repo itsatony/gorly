@@ -14,9 +14,8 @@
 #   make deps         - Download dependencies
 #   make check        - Run all checks (fmt, vet, lint, test)
 #   make redis-setup  - Setup Redis for testing with Podman
-#   make examples     - Build example applications
 
-.PHONY: help build test test-redis test-redis-setup test-redis-verbose bench coverage lint fmt vet clean deps check redis-setup redis-cleanup redis-logs redis-cli docker docker-test docker-clean examples all
+.PHONY: help build test test-redis test-redis-setup test-redis-verbose bench coverage lint fmt vet clean deps check redis-setup redis-cleanup redis-logs redis-cli docker docker-test docker-clean all
 
 # Variables
 GOCMD=go
@@ -53,11 +52,6 @@ build: ## Build all packages
 	@echo "Building all packages..."
 	$(GOBUILD) $(BUILD_FLAGS) ./...
 
-build-cli: ## Build CLI binary
-	@echo "Building CLI binary..."
-	@mkdir -p bin
-	$(GOBUILD) $(BUILD_FLAGS) -o bin/gorly ./cmd/gorly
-
 # Test targets  
 test: ## Run all tests
 	@echo "Running all tests..."
@@ -88,16 +82,16 @@ test-redis: ## Run Redis integration tests (requires Redis)
 		exit 1; \
 	fi
 	@echo "✅ Redis is available, running tests..."
-	$(GOTEST) $(TEST_FLAGS) -tags=redis ./test/redis/...
+	$(GOTEST) $(TEST_FLAGS) -tags=redis ./stores/...
 
 test-redis-setup: ## Setup Redis and run integration tests
 	@echo "Setting up Redis and running integration tests..."
 	./scripts/setup-redis.sh
-	$(GOTEST) $(TEST_FLAGS) -tags=redis ./test/redis/...
+	$(GOTEST) $(TEST_FLAGS) -tags=redis ./stores/...
 
 test-redis-verbose: ## Run Redis tests with verbose output
 	@echo "Running Redis integration tests (verbose)..."
-	$(GOTEST) $(TEST_FLAGS) -tags=redis -v ./test/redis/...
+	$(GOTEST) $(TEST_FLAGS) -tags=redis -v ./stores/...
 
 bench: ## Run benchmarks
 	@echo "Running benchmarks..."
@@ -246,31 +240,6 @@ docker-clean: ## Clean containers and images
 		docker-compose down --rmi all --volumes; \
 	else \
 		echo "❌ Neither podman-compose nor docker-compose found"; \
-	fi
-
-# Example targets
-examples: ## Build example applications
-	@echo "Building example applications..."
-	@if [ -d "examples" ]; then \
-		for example in examples/*/; do \
-			if [ -f "$$example/main.go" ]; then \
-				echo "Building $$example..."; \
-				(cd "$$example" && $(GOBUILD) $(BUILD_FLAGS) .); \
-			fi; \
-		done; \
-	else \
-		echo "No examples directory found"; \
-	fi
-
-examples-run: ## Run example applications
-	@echo "Running example applications..."
-	@if [ -d "examples" ]; then \
-		for example in examples/*/; do \
-			if [ -f "$$example/main.go" ]; then \
-				echo "Running $$example..."; \
-				(cd "$$example" && timeout 10s $(GOCMD) run . || true); \
-			fi; \
-		done; \
 	fi
 
 # Clean targets

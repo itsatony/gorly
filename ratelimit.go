@@ -1,4 +1,53 @@
-// ratelimit.go
+// Package ratelimit provides production-ready rate limiting for Go applications.
+//
+// Gorly is designed for simplicity and performance, with a clean API that scales
+// from prototype to production without changes. It supports multiple storage backends
+// (in-memory for development, Redis for production), flexible identity extraction
+// (IP-based, API key-based, user-based), and comprehensive HTTP middleware.
+//
+// # Quick Start
+//
+// Get started with a one-liner:
+//
+//	import "github.com/itsatony/gorly/middleware"
+//	http.Handle("/api/", middleware.QuickLimit(100, time.Minute, yourHandler))
+//
+// Or build a custom limiter in 3 lines:
+//
+//	store, _ := stores.NewMemoryStore(nil)
+//	limiter, _ := ratelimit.NewSimple(store, 100, time.Hour)
+//	result, _ := limiter.Allow(ctx, ratelimit.NewIPContext("192.168.1.1"))
+//
+// # Core Concepts
+//
+// Identity: Who/what is being rate limited (IP address, user ID, API key, etc.)
+//
+// Scope: What operation is being rate limited (global, search, upload, etc.)
+//
+// Tier: The user's subscription level (free, premium, enterprise)
+//
+// Store: Where rate limit state is persisted (memory or Redis)
+//
+// # Production Features
+//
+// - Thread-safe with race detector testing
+// - Proper error handling (distinguish errors from rate limits)
+// - Redis-backed for distributed systems
+// - Configurable algorithms (token bucket, sliding window)
+// - Multi-tier support (different limits per subscription level)
+// - Scope-based limits (different limits per operation type)
+//
+// # Architecture
+//
+// Gorly follows a clean architecture with clear separation:
+//
+//	RateLimiter (interface) -> Algorithm -> Store
+//	     ↓
+//	  Identity (who is making the request)
+//	     ↓
+//	  Result (allowed/denied + metadata)
+//
+// See the README for detailed examples and recipes.
 package ratelimit
 
 import (
@@ -6,233 +55,70 @@ import (
 	"time"
 )
 
-// AuthEntity represents a flexible authentication entity for rate limiting
-// Can be API keys, users, tenants, IP addresses, or custom entities
-type AuthEntity interface {
-	// ID returns the unique identifier for this entity
-	ID() string
-
-	// Type returns the entity type (api_key, user, tenant, ip, custom)
-	Type() string
-
-	// Tier returns the service tier (free, premium, enterprise, custom)
-	Tier() string
-
-	// Metadata returns additional entity-specific metadata
-	Metadata() map[string]interface{}
-}
-
-// DefaultAuthEntity provides a simple implementation of AuthEntity
-type DefaultAuthEntity struct {
-	IDValue       string                 `json:"id"`
-	TypeValue     string                 `json:"type"`
-	TierValue     string                 `json:"tier"`
-	MetadataValue map[string]interface{} `json:"metadata,omitempty"`
-}
-
-func (e *DefaultAuthEntity) ID() string   { return e.IDValue }
-func (e *DefaultAuthEntity) Type() string { return e.TypeValue }
-func (e *DefaultAuthEntity) Tier() string { return e.TierValue }
-func (e *DefaultAuthEntity) Metadata() map[string]interface{} {
-	if e.MetadataValue == nil {
-		return make(map[string]interface{})
-	}
-	return e.MetadataValue
-}
-
-// NewDefaultAuthEntity creates a new DefaultAuthEntity
-func NewDefaultAuthEntity(id, entityType, tier string) *DefaultAuthEntity {
-	return &DefaultAuthEntity{
-		IDValue:       id,
-		TypeValue:     entityType,
-		TierValue:     tier,
-		MetadataValue: make(map[string]interface{}),
-	}
-}
-
-// Result represents the result of a rate limit check
-type Result struct {
-	// Allowed indicates whether the request is allowed
-	Allowed bool `json:"allowed"`
-
-	// Remaining indicates how many requests are remaining in the current window
-	Remaining int64 `json:"remaining"`
-
-	// RetryAfter indicates when the client can retry (for denied requests)
-	RetryAfter time.Duration `json:"retry_after"`
-
-	// ResetTime indicates when the rate limit window resets
-	ResetTime time.Time `json:"reset_time"`
-
-	// Limit indicates the total limit for this entity/scope
-	Limit int64 `json:"limit"`
-
-	// Window indicates the time window for this rate limit
-	Window time.Duration `json:"window"`
-
-	// Used indicates how many requests have been used in current window
-	Used int64 `json:"used"`
-
-	// Algorithm indicates which rate limiting algorithm was used
-	Algorithm string `json:"algorithm"`
-}
-
-// Stats represents usage statistics for an entity
-type Stats struct {
-	// Entity information
-	Entity AuthEntity `json:"entity"`
-
-	// Per-scope statistics
-	Scopes map[string]ScopeStats `json:"scopes"`
-
-	// Overall statistics
-	TotalRequests int64     `json:"total_requests"`
-	TotalDenied   int64     `json:"total_denied"`
-	LastRequest   time.Time `json:"last_request,omitempty"`
-	FirstRequest  time.Time `json:"first_request,omitempty"`
-
-	// Performance metrics
-	AverageLatency time.Duration `json:"average_latency"`
-	MaxLatency     time.Duration `json:"max_latency"`
-
-	// Rate limiting metrics
-	RateLimitHits   int64 `json:"rate_limit_hits"`
-	RateLimitMisses int64 `json:"rate_limit_misses"`
-}
-
-// ScopeStats represents statistics for a specific scope
-type ScopeStats struct {
-	Scope        string        `json:"scope"`
-	RequestCount int64         `json:"request_count"`
-	DeniedCount  int64         `json:"denied_count"`
-	LastRequest  time.Time     `json:"last_request,omitempty"`
-	CurrentUsage int64         `json:"current_usage"`
-	Limit        int64         `json:"limit"`
-	Window       time.Duration `json:"window"`
-	Algorithm    string        `json:"algorithm"`
-}
+// ============================================================================
+// CORE RATE LIMITER INTERFACE
+// ============================================================================
 
 // RateLimiter is the core interface for rate limiting functionality
+// This is the main entry point for all rate limiting operations
 type RateLimiter interface {
-	// Allow checks if a request is allowed for the given entity and scope
-	Allow(ctx context.Context, entity AuthEntity, scope string) (*Result, error)
+	// Check performs a rate limit check WITHOUT consuming tokens
+	// Useful for preflight checks or monitoring
+	Check(ctx context.Context, rlCtx Identity) (*Result, error)
 
-	// AllowN checks if N requests are allowed for the given entity and scope
-	AllowN(ctx context.Context, entity AuthEntity, scope string, n int64) (*Result, error)
+	// Allow performs a rate limit check and CONSUMES one token if allowed
+	// This is the main method for enforcing rate limits
+	Allow(ctx context.Context, rlCtx Identity) (*Result, error)
 
-	// Reset resets the rate limit for the given entity and scope
-	Reset(ctx context.Context, entity AuthEntity, scope string) error
+	// AllowN performs a rate limit check and consumes N tokens if allowed
+	// Useful for batch operations or operations with different costs
+	AllowN(ctx context.Context, rlCtx Identity, n int64) (*Result, error)
 
-	// Stats returns usage statistics for the given entity
-	Stats(ctx context.Context, entity AuthEntity) (*Stats, error)
+	// Reset clears the rate limit for the given context
+	// Useful for administrative overrides or testing
+	Reset(ctx context.Context, rlCtx Identity) error
 
-	// ScopeStats returns statistics for a specific entity and scope
-	ScopeStats(ctx context.Context, entity AuthEntity, scope string) (*ScopeStats, error)
+	// Stats returns usage statistics for the given context
+	// Provides visibility into current rate limit state
+	Stats(ctx context.Context, rlCtx Identity) (*Result, error)
 
-	// Health checks the health of the rate limiter (e.g., Redis connectivity)
+	// Health checks the health of the rate limiter
+	// Verifies store connectivity and system health
 	Health(ctx context.Context) error
 
-	// Close cleans up any resources used by the rate limiter
+	// Close cleanly shuts down the rate limiter
+	// Releases resources, closes connections, stops goroutines
 	Close() error
 }
 
-// ErrorType represents different types of rate limiting errors
-type ErrorType string
+// ============================================================================
+// HEALTH CHECK RESULT
+// ============================================================================
 
-const (
-	ErrorTypeStore     ErrorType = "store_error"
-	ErrorTypeAlgorithm ErrorType = "algorithm_error"
-	ErrorTypeConfig    ErrorType = "config_error"
-	ErrorTypeNetwork   ErrorType = "network_error"
-	ErrorTypeTimeout   ErrorType = "timeout_error"
-)
+// HealthStatus represents the health status of the rate limiter
+type HealthStatus struct {
+	// Overall health
+	Healthy bool `json:"healthy"`
 
-// RateLimitError represents an error in rate limiting operations
-type RateLimitError struct {
-	Type    ErrorType `json:"type"`
-	Message string    `json:"message"`
-	Scope   string    `json:"scope,omitempty"`
-	Entity  string    `json:"entity,omitempty"`
-	Err     error     `json:"-"` // Don't serialize the wrapped error
+	// Component health
+	StoreHealthy    bool `json:"store_healthy"`
+	StrategyHealthy bool `json:"strategy_healthy"`
+
+	// Details
+	Message   string                 `json:"message,omitempty"`
+	Timestamp time.Time              `json:"timestamp"`
+	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+
+	// Performance
+	ResponseTime time.Duration `json:"response_time,omitempty"`
 }
 
-func (e *RateLimitError) Error() string {
-	if e.Err != nil {
-		return e.Message + ": " + e.Err.Error()
+// NewHealthStatus creates a new health status
+func NewHealthStatus(healthy bool, message string) *HealthStatus {
+	return &HealthStatus{
+		Healthy:   healthy,
+		Message:   message,
+		Timestamp: time.Now(),
+		Metadata:  make(map[string]interface{}),
 	}
-	return e.Message
-}
-
-func (e *RateLimitError) Unwrap() error {
-	return e.Err
-}
-
-// NewRateLimitError creates a new RateLimitError
-func NewRateLimitError(errorType ErrorType, message string, err error) *RateLimitError {
-	return &RateLimitError{
-		Type:    errorType,
-		Message: message,
-		Err:     err,
-	}
-}
-
-// Common entity types
-const (
-	EntityTypeAPIKey = "api_key"
-	EntityTypeUser   = "user"
-	EntityTypeTenant = "tenant"
-	EntityTypeIP     = "ip"
-	EntityTypeCustom = "custom"
-)
-
-// Common service tiers
-const (
-	TierFree       = "free"
-	TierPremium    = "premium"
-	TierEnterprise = "enterprise"
-	TierCustom     = "custom"
-)
-
-// Common scopes
-const (
-	ScopeGlobal    = "global"
-	ScopeMemory    = "memory"
-	ScopeSearch    = "search"
-	ScopeMetadata  = "metadata"
-	ScopeAnalytics = "analytics"
-	ScopeAdmin     = "admin"
-)
-
-// KeyBuilder helps build consistent keys for rate limiting
-type KeyBuilder struct {
-	prefix string
-}
-
-// NewKeyBuilder creates a new KeyBuilder with the given prefix
-func NewKeyBuilder(prefix string) *KeyBuilder {
-	return &KeyBuilder{prefix: prefix}
-}
-
-// BuildKey builds a key for the given entity and scope
-func (kb *KeyBuilder) BuildKey(entity AuthEntity, scope string) string {
-	if kb.prefix == "" {
-		return entity.Type() + ":" + entity.ID() + ":" + scope
-	}
-	return kb.prefix + ":" + entity.Type() + ":" + entity.ID() + ":" + scope
-}
-
-// BuildStatsKey builds a key for statistics storage
-func (kb *KeyBuilder) BuildStatsKey(entity AuthEntity) string {
-	if kb.prefix == "" {
-		return "stats:" + entity.Type() + ":" + entity.ID()
-	}
-	return kb.prefix + ":stats:" + entity.Type() + ":" + entity.ID()
-}
-
-// BuildGlobalStatsKey builds a key for global statistics
-func (kb *KeyBuilder) BuildGlobalStatsKey() string {
-	if kb.prefix == "" {
-		return "stats:global"
-	}
-	return kb.prefix + ":stats:global"
 }

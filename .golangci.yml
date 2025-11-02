@@ -120,7 +120,6 @@ linters:
     - whitespace
   # Disable specific linters that are too strict for this project
   disable:
-    - forbidigo # Allow fmt.Print in examples
     - gomnd # Allow magic numbers in some contexts
 
 issues:
@@ -134,12 +133,6 @@ issues:
         - gosec
         - goconst
         - gocyclo
-    # Exclude some linters from running on examples
-    - path: examples/
-      linters:
-        - gomnd
-        - forbidigo
-        - gosec
     # Exclude known linter issues
     - text: "weak cryptographic primitive"
       linters:

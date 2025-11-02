@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -26,6 +27,19 @@ type Store interface {
 	Get(ctx context.Context, key string) ([]byte, error)
 	Set(ctx context.Context, key string, value []byte, expiration time.Duration) error
 	Delete(ctx context.Context, key string) error
+	ExecuteScript(ctx context.Context, script string, keys []string, args ...interface{}) (interface{}, error)
+}
+
+// IsErrScriptNotSupported checks if an error indicates script execution is not supported
+func IsErrScriptNotSupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check error message for script not supported indication
+	// Use Contains to handle wrapped errors from different store implementations
+	errMsg := err.Error()
+	return strings.Contains(errMsg, "script execution not supported") ||
+		strings.Contains(errMsg, "SCRIPT_NOT_SUPPORTED")
 }
 
 // RateLimitError represents an error in rate limiting operations
@@ -49,6 +63,30 @@ func NewRateLimitError(errorType, message string, err error) *RateLimitError {
 		Message: message,
 		Err:     err,
 	}
+}
+
+// P0-3 FIX: clampStatistics ensures statistics are within valid bounds
+// This prevents impossible values like Remaining > Limit or Used > Limit
+// which can occur due to race conditions, precision issues, or edge cases
+func clampStatistics(remaining, limit int64) (clampedRemaining, clampedUsed int64) {
+	// Clamp remaining to valid range [0, limit]
+	if remaining < 0 {
+		clampedRemaining = 0
+	} else if remaining > limit {
+		clampedRemaining = limit
+	} else {
+		clampedRemaining = remaining
+	}
+
+	// Calculate used, ensuring it's also in valid range [0, limit]
+	clampedUsed = limit - clampedRemaining
+
+	// Defensive: ensure used is never negative (shouldn't happen, but be safe)
+	if clampedUsed < 0 {
+		clampedUsed = 0
+	}
+
+	return clampedRemaining, clampedUsed
 }
 
 // TokenBucketAlgorithm implements the token bucket rate limiting algorithm
@@ -93,20 +131,106 @@ type TokenBucketState struct {
 }
 
 // Allow checks if N requests are allowed and updates the bucket state
+// Uses atomic Lua script in Redis to prevent race conditions
 func (tb *TokenBucketAlgorithm) Allow(ctx context.Context, store Store, key string, limit int64, window time.Duration, n int64) (*Result, error) {
-	if n <= 0 {
+	// Comprehensive input validation to prevent integer overflow and invalid inputs
+	if err := ValidateKey(key); err != nil {
 		return &Result{
-				Allowed:    false,
-				Remaining:  0,
-				RetryAfter: time.Second,
-				Algorithm:  tb.name,
-			}, NewRateLimitError(
-				"config",
-				"request count must be positive",
-				nil,
-			)
+			Allowed:    false,
+			Remaining:  0,
+			RetryAfter: 0,
+			Algorithm:  tb.name,
+		}, NewRateLimitError("validation", err.Error(), err)
 	}
 
+	if err := ValidateAllowInputs(limit, window, n); err != nil {
+		return &Result{
+			Allowed:    false,
+			Remaining:  0,
+			RetryAfter: 0,
+			Limit:      limit,
+			Window:     window,
+			Algorithm:  tb.name,
+		}, NewRateLimitError("validation", err.Error(), err)
+	}
+
+	// Try atomic Lua script first (race-free)
+	result, err := tb.allowAtomic(ctx, store, key, limit, window, n)
+	if err == nil {
+		return result, nil
+	}
+
+	// If script not supported (memory store), fall back to non-atomic method
+	// WARNING: This has race conditions in concurrent scenarios
+	if !IsErrScriptNotSupported(err) {
+		return nil, err
+	}
+
+	// Fallback to non-atomic method for memory store
+	return tb.allowNonAtomic(ctx, store, key, limit, window, n)
+}
+
+// allowAtomic uses Redis Lua script for atomic rate limiting (no race conditions)
+func (tb *TokenBucketAlgorithm) allowAtomic(ctx context.Context, store Store, key string, limit int64, window time.Duration, n int64) (*Result, error) {
+	now := time.Now()
+	nowNano := now.UnixNano()
+	windowSec := int64(window.Seconds())
+	ttlSec := windowSec * 2 // Keep state for 2x window for clock skew tolerance
+
+	// Execute atomic Lua script
+	// Returns: {allowed (1/0), remaining, tokens_before, tokens_after, reset_timestamp_nano}
+	scriptResult, err := store.ExecuteScript(ctx, TokenBucketScript, []string{key},
+		limit,     // ARGV[1]
+		windowSec, // ARGV[2]
+		n,         // ARGV[3]
+		nowNano,   // ARGV[4]
+		ttlSec,    // ARGV[5]
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse Lua result
+	results, ok := scriptResult.([]interface{})
+	if !ok || len(results) < 5 {
+		return nil, NewRateLimitError("algorithm", "invalid script result format", nil)
+	}
+
+	allowedInt := results[0].(int64)
+	remaining := results[1].(int64)
+	// tokensAfter := results[3] // Available if needed for debugging
+	resetNano := results[4].(int64)
+
+	allowed := allowedInt == 1
+	resetTime := time.Unix(0, resetNano)
+
+	var retryAfter time.Duration
+	if !allowed {
+		retryAfter = resetTime.Sub(now)
+		if retryAfter < 0 {
+			retryAfter = 0
+		}
+	}
+
+	// P0-3 FIX: Clamp statistics to valid range to prevent impossible values
+	// This ensures Remaining and Used never exceed Limit, even with race conditions
+	clampedRemaining, clampedUsed := clampStatistics(remaining, limit)
+
+	return &Result{
+		Allowed:    allowed,
+		Remaining:  clampedRemaining,
+		RetryAfter: retryAfter,
+		ResetTime:  resetTime,
+		Limit:      limit,
+		Window:     window,
+		Used:       clampedUsed,
+		Algorithm:  tb.name,
+	}, nil
+}
+
+// allowNonAtomic is the fallback non-atomic implementation for memory store
+// WARNING: This has race conditions in high-concurrency scenarios
+func (tb *TokenBucketAlgorithm) allowNonAtomic(ctx context.Context, store Store, key string, limit int64, window time.Duration, n int64) (*Result, error) {
 	// Calculate refill rate (tokens per second)
 	refillRate := float64(limit) / window.Seconds()
 
@@ -159,14 +283,18 @@ func (tb *TokenBucketAlgorithm) Allow(ctx context.Context, store Store, key stri
 		return nil, err
 	}
 
+	// P0-3 FIX: Clamp statistics to valid range to prevent impossible values
+	// This ensures Remaining and Used never exceed Limit, even with race conditions or precision issues
+	clampedRemaining, clampedUsed := clampStatistics(remaining, limit)
+
 	return &Result{
 		Allowed:    allowed,
-		Remaining:  remaining,
+		Remaining:  clampedRemaining,
 		RetryAfter: retryAfter,
 		ResetTime:  resetTime,
 		Limit:      limit,
 		Window:     window,
-		Used:       limit - remaining,
+		Used:       clampedUsed,
 		Algorithm:  tb.name,
 	}, nil
 }

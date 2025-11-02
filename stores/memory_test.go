@@ -1,523 +1,618 @@
-// stores/memory_test.go
 package stores
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	ratelimit "github.com/itsatony/gorly"
 )
 
-func TestNewMemoryStore(t *testing.T) {
-	config := MemoryConfig{
-		MaxKeys:         1000,
-		CleanupInterval: time.Minute,
-		DefaultTTL:      time.Hour,
-	}
+// ============================================================================
+// BASIC FUNCTIONALITY TESTS
+// ============================================================================
 
-	store, err := NewMemoryStore(config)
+func TestNewMemoryStore(t *testing.T) {
+	store, err := NewMemoryStore(nil)
 	if err != nil {
-		t.Fatalf("Failed to create memory store: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	defer store.Close()
 
-	if store == nil {
-		t.Fatal("Expected store to be created")
+	stats := store.Stats()
+	if stats.ShardCount != int(ratelimit.DefaultShardCount) {
+		t.Errorf("expected %d shards, got %d", ratelimit.DefaultShardCount, stats.ShardCount)
 	}
-
-	// Test health check
-	if err := store.Health(context.Background()); err != nil {
-		t.Errorf("Expected health check to pass, got error: %v", err)
+	if stats.TotalKeys != 0 {
+		t.Errorf("expected 0 keys, got %d", stats.TotalKeys)
 	}
 }
 
-func TestMemoryStore_SetAndGet(t *testing.T) {
-	config := MemoryConfig{
-		MaxKeys:         1000,
-		CleanupInterval: time.Minute,
-		DefaultTTL:      time.Hour,
-	}
-
-	store, err := NewMemoryStore(config)
+func TestMemoryStoreSetGet(t *testing.T) {
+	store, err := NewMemoryStore(nil)
 	if err != nil {
-		t.Fatalf("Failed to create memory store: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	defer store.Close()
 
 	ctx := context.Background()
-	key := "test:key"
-	value := []byte("test value")
+	key := "test_key"
+	value := []byte("test_value")
 
-	// Test Set
-	if err := store.Set(ctx, key, value, time.Hour); err != nil {
-		t.Fatalf("Failed to set value: %v", err)
+	// Set
+	err = store.Set(ctx, key, value, 0)
+	if err != nil {
+		t.Fatalf("Set failed: %v", err)
 	}
 
-	// Test Get
+	// Get
 	retrieved, err := store.Get(ctx, key)
 	if err != nil {
-		t.Fatalf("Failed to get value: %v", err)
+		t.Fatalf("Get failed: %v", err)
 	}
 
 	if string(retrieved) != string(value) {
-		t.Errorf("Expected value %s, got %s", string(value), string(retrieved))
-	}
-
-	// Test modification isolation (ensure copies are made)
-	value[0] = 'X'
-	retrieved[0] = 'Y'
-
-	// Get again to verify original value is unchanged
-	retrieved2, err := store.Get(ctx, key)
-	if err != nil {
-		t.Fatalf("Failed to get value again: %v", err)
-	}
-
-	if string(retrieved2) != "test value" {
-		t.Errorf("Expected original value to be unchanged, got %s", string(retrieved2))
+		t.Errorf("expected %s, got %s", value, retrieved)
 	}
 }
 
-func TestMemoryStore_GetNonExistentKey(t *testing.T) {
-	config := MemoryConfig{
-		MaxKeys:         1000,
-		CleanupInterval: time.Minute,
-		DefaultTTL:      time.Hour,
-	}
-
-	store, err := NewMemoryStore(config)
+func TestMemoryStoreGetNonExistent(t *testing.T) {
+	store, err := NewMemoryStore(nil)
 	if err != nil {
-		t.Fatalf("Failed to create memory store: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	defer store.Close()
 
 	ctx := context.Background()
-
 	_, err = store.Get(ctx, "nonexistent")
-	if err == nil {
-		t.Error("Expected error for nonexistent key")
-	}
 
-	storeErr, ok := err.(*StoreError)
-	if !ok {
-		t.Errorf("Expected StoreError, got %T", err)
-	} else if storeErr.Type != "store" || storeErr.Message != "key not found" {
-		t.Errorf("Expected store error with 'key not found', got %s: %s", storeErr.Type, storeErr.Message)
+	if err != ratelimit.ErrKeyNotFound {
+		t.Errorf("expected ErrKeyNotFound, got %v", err)
 	}
 }
 
-func TestMemoryStore_Expiration(t *testing.T) {
-	config := MemoryConfig{
-		MaxKeys:         1000,
-		CleanupInterval: 50 * time.Millisecond, // Fast cleanup for testing
-		DefaultTTL:      time.Hour,
-	}
-
-	store, err := NewMemoryStore(config)
+func TestMemoryStoreDelete(t *testing.T) {
+	store, err := NewMemoryStore(nil)
 	if err != nil {
-		t.Fatalf("Failed to create memory store: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	defer store.Close()
 
 	ctx := context.Background()
-	key := "test:expiring"
-	value := []byte("expiring value")
+	key := "test_key"
+	value := []byte("test_value")
+
+	// Set then delete
+	store.Set(ctx, key, value, 0)
+	err = store.Delete(ctx, key)
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	// Verify deleted
+	_, err = store.Get(ctx, key)
+	if err != ratelimit.ErrKeyNotFound {
+		t.Error("key should not exist after deletion")
+	}
+}
+
+func TestMemoryStoreExists(t *testing.T) {
+	store, err := NewMemoryStore(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	key := "test_key"
+
+	// Should not exist initially
+	exists, err := store.Exists(ctx, key)
+	if err != nil {
+		t.Fatalf("Exists failed: %v", err)
+	}
+	if exists {
+		t.Error("key should not exist")
+	}
+
+	// Set and check again
+	store.Set(ctx, key, []byte("value"), 0)
+	exists, err = store.Exists(ctx, key)
+	if err != nil {
+		t.Fatalf("Exists failed: %v", err)
+	}
+	if !exists {
+		t.Error("key should exist")
+	}
+}
+
+// ============================================================================
+// INCREMENT TESTS
+// ============================================================================
+
+func TestMemoryStoreIncrement(t *testing.T) {
+	store, err := NewMemoryStore(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	key := "counter"
+
+	// Increment from 0
+	val, err := store.Increment(ctx, key, 0)
+	if err != nil {
+		t.Fatalf("Increment failed: %v", err)
+	}
+	if val != 1 {
+		t.Errorf("expected 1, got %d", val)
+	}
+
+	// Increment again
+	val, err = store.Increment(ctx, key, 0)
+	if err != nil {
+		t.Fatalf("Increment failed: %v", err)
+	}
+	if val != 2 {
+		t.Errorf("expected 2, got %d", val)
+	}
+}
+
+func TestMemoryStoreIncrementBy(t *testing.T) {
+	store, err := NewMemoryStore(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	key := "counter"
+
+	// Increment by 5
+	val, err := store.IncrementBy(ctx, key, 5, 0)
+	if err != nil {
+		t.Fatalf("IncrementBy failed: %v", err)
+	}
+	if val != 5 {
+		t.Errorf("expected 5, got %d", val)
+	}
+
+	// Increment by 3
+	val, err = store.IncrementBy(ctx, key, 3, 0)
+	if err != nil {
+		t.Fatalf("IncrementBy failed: %v", err)
+	}
+	if val != 8 {
+		t.Errorf("expected 8, got %d", val)
+	}
+}
+
+// ============================================================================
+// EXPIRATION TESTS
+// ============================================================================
+
+func TestMemoryStoreExpiration(t *testing.T) {
+	store, err := NewMemoryStore(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	key := "expiring_key"
+	value := []byte("expiring_value")
 
 	// Set with short expiration
-	if err := store.Set(ctx, key, value, 100*time.Millisecond); err != nil {
-		t.Fatalf("Failed to set value: %v", err)
+	err = store.Set(ctx, key, value, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Set failed: %v", err)
 	}
 
-	// Should be retrievable immediately
-	_, err = store.Get(ctx, key)
+	// Should exist immediately
+	retrieved, err := store.Get(ctx, key)
 	if err != nil {
-		t.Fatalf("Failed to get value before expiration: %v", err)
+		t.Fatalf("Get failed: %v", err)
+	}
+	if string(retrieved) != string(value) {
+		t.Error("value mismatch")
 	}
 
 	// Wait for expiration
 	time.Sleep(150 * time.Millisecond)
 
-	// Should not be retrievable after expiration
+	// Should not exist after expiration
 	_, err = store.Get(ctx, key)
-	if err == nil {
-		t.Error("Expected error for expired key")
-	}
-
-	// Wait for cleanup to run
-	time.Sleep(100 * time.Millisecond)
-
-	// Check that key is actually removed
-	stats := store.Stats()
-	if stats["expired"].(int64) == 0 {
-		t.Error("Expected expired counter to be greater than 0")
+	if err != ratelimit.ErrKeyNotFound {
+		t.Error("key should have expired")
 	}
 }
 
-func TestMemoryStore_TTL(t *testing.T) {
-	config := MemoryConfig{
-		MaxKeys:         1000,
-		CleanupInterval: time.Minute,
-		DefaultTTL:      time.Hour,
-	}
-
-	store, err := NewMemoryStore(config)
+func TestMemoryStoreIncrementExpiration(t *testing.T) {
+	store, err := NewMemoryStore(nil)
 	if err != nil {
-		t.Fatalf("Failed to create memory store: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	defer store.Close()
 
 	ctx := context.Background()
-	key := "test:ttl"
-	value := []byte("ttl value")
+	key := "expiring_counter"
 
-	// Test TTL for nonexistent key
-	ttl, err := store.TTL(ctx, "nonexistent")
+	// Increment with expiration
+	val, err := store.Increment(ctx, key, 100*time.Millisecond)
 	if err != nil {
-		t.Fatalf("Failed to get TTL: %v", err)
+		t.Fatalf("Increment failed: %v", err)
 	}
-	if ttl != -2*time.Second {
-		t.Errorf("Expected TTL -2s for nonexistent key, got %v", ttl)
-	}
-
-	// Set with expiration
-	expiration := 5 * time.Second
-	if err := store.Set(ctx, key, value, expiration); err != nil {
-		t.Fatalf("Failed to set value: %v", err)
+	if val != 1 {
+		t.Errorf("expected 1, got %d", val)
 	}
 
-	// Check TTL
-	ttl, err = store.TTL(ctx, key)
+	// Wait for expiration
+	time.Sleep(150 * time.Millisecond)
+
+	// Next increment should start from 1 again
+	val, err = store.Increment(ctx, key, 100*time.Millisecond)
 	if err != nil {
-		t.Fatalf("Failed to get TTL: %v", err)
+		t.Fatalf("Increment failed: %v", err)
 	}
-
-	// Should be approximately the expiration time (allowing for some variance)
-	if ttl < 4*time.Second || ttl > expiration {
-		t.Errorf("Expected TTL around %v, got %v", expiration, ttl)
-	}
-
-	// Set without expiration (using default TTL)
-	key2 := "test:no_expiration"
-	if err := store.Set(ctx, key2, value, 0); err != nil {
-		t.Fatalf("Failed to set value: %v", err)
-	}
-
-	// Check TTL - should use default TTL
-	ttl, err = store.TTL(ctx, key2)
-	if err != nil {
-		t.Fatalf("Failed to get TTL: %v", err)
-	}
-
-	// Should be approximately the default TTL
-	if ttl < 55*time.Minute || ttl > time.Hour {
-		t.Errorf("Expected TTL around %v, got %v", time.Hour, ttl)
+	if val != 1 {
+		t.Errorf("expected 1 after expiration, got %d", val)
 	}
 }
 
-func TestMemoryStore_Increment(t *testing.T) {
-	config := MemoryConfig{
-		MaxKeys:         1000,
-		CleanupInterval: time.Minute,
-		DefaultTTL:      time.Hour,
+// ============================================================================
+// CLEANUP TESTS
+// ============================================================================
+
+func TestMemoryStoreCleanup(t *testing.T) {
+	config := &MemoryStoreConfig{
+		ShardCount:      4,
+		CleanupInterval: 1 * time.Second,
+		MaxKeys:         0,
+		Logger:          ratelimit.NewNopLogger(),
 	}
 
 	store, err := NewMemoryStore(config)
 	if err != nil {
-		t.Fatalf("Failed to create memory store: %v", err)
-	}
-	defer store.Close()
-
-	ctx := context.Background()
-	key := "test:counter"
-
-	// First increment should create counter with value 1
-	value, err := store.Increment(ctx, key, time.Hour)
-	if err != nil {
-		t.Fatalf("Failed to increment: %v", err)
-	}
-	if value != 1 {
-		t.Errorf("Expected first increment to be 1, got %d", value)
-	}
-
-	// Second increment should be 2
-	value, err = store.Increment(ctx, key, time.Hour)
-	if err != nil {
-		t.Fatalf("Failed to increment: %v", err)
-	}
-	if value != 2 {
-		t.Errorf("Expected second increment to be 2, got %d", value)
-	}
-
-	// IncrementBy with larger amount
-	value, err = store.IncrementBy(ctx, key, 5, time.Hour)
-	if err != nil {
-		t.Fatalf("Failed to increment by 5: %v", err)
-	}
-	if value != 7 {
-		t.Errorf("Expected increment by 5 to be 7, got %d", value)
-	}
-}
-
-func TestMemoryStore_MultiOperations(t *testing.T) {
-	config := MemoryConfig{
-		MaxKeys:         1000,
-		CleanupInterval: time.Minute,
-		DefaultTTL:      time.Hour,
-	}
-
-	store, err := NewMemoryStore(config)
-	if err != nil {
-		t.Fatalf("Failed to create memory store: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	defer store.Close()
 
 	ctx := context.Background()
 
-	// Test MultiSet
-	keyValues := map[string][]byte{
-		"key1": []byte("value1"),
-		"key2": []byte("value2"),
-		"key3": []byte("value3"),
-	}
-
-	if err := store.MultiSet(ctx, keyValues, time.Hour); err != nil {
-		t.Fatalf("Failed to multi set: %v", err)
-	}
-
-	// Test MultiGet
-	keys := []string{"key1", "key2", "key3", "nonexistent"}
-	results, err := store.MultiGet(ctx, keys)
-	if err != nil {
-		t.Fatalf("Failed to multi get: %v", err)
-	}
-
-	if len(results) != 3 {
-		t.Errorf("Expected 3 results, got %d", len(results))
-	}
-
-	for key, expectedValue := range keyValues {
-		if result, exists := results[key]; !exists {
-			t.Errorf("Expected key %s to exist in results", key)
-		} else if string(result) != string(expectedValue) {
-			t.Errorf("Expected value %s for key %s, got %s", string(expectedValue), key, string(result))
-		}
-	}
-
-	// Test IncrementMulti
-	counterKeys := []string{"counter1", "counter2", "counter3"}
-	amounts := []int64{1, 5, 10}
-
-	counterResults, err := store.IncrementMulti(ctx, counterKeys, amounts, time.Hour)
-	if err != nil {
-		t.Fatalf("Failed to multi increment: %v", err)
-	}
-
-	if len(counterResults) != 3 {
-		t.Errorf("Expected 3 counter results, got %d", len(counterResults))
-	}
-
-	for i, key := range counterKeys {
-		if result, exists := counterResults[key]; !exists {
-			t.Errorf("Expected key %s to exist in counter results", key)
-		} else if result != amounts[i] {
-			t.Errorf("Expected counter value %d for key %s, got %d", amounts[i], key, result)
-		}
-	}
-}
-
-func TestMemoryStore_Delete(t *testing.T) {
-	config := MemoryConfig{
-		MaxKeys:         1000,
-		CleanupInterval: time.Minute,
-		DefaultTTL:      time.Hour,
-	}
-
-	store, err := NewMemoryStore(config)
-	if err != nil {
-		t.Fatalf("Failed to create memory store: %v", err)
-	}
-	defer store.Close()
-
-	ctx := context.Background()
-	key := "test:delete"
-	value := []byte("delete me")
-
-	// Set value
-	if err := store.Set(ctx, key, value, time.Hour); err != nil {
-		t.Fatalf("Failed to set value: %v", err)
-	}
-
-	// Verify it exists
-	if exists, err := store.Exists(ctx, key); err != nil || !exists {
-		t.Fatalf("Expected key to exist before delete")
-	}
-
-	// Delete
-	if err := store.Delete(ctx, key); err != nil {
-		t.Fatalf("Failed to delete: %v", err)
-	}
-
-	// Verify it doesn't exist
-	if exists, err := store.Exists(ctx, key); err != nil || exists {
-		t.Errorf("Expected key to not exist after delete")
-	}
-
-	// Try to get deleted key
-	_, err = store.Get(ctx, key)
-	if err == nil {
-		t.Error("Expected error when getting deleted key")
-	}
-}
-
-func TestMemoryStore_MaxKeys(t *testing.T) {
-	config := MemoryConfig{
-		MaxKeys:         5, // Small limit for testing
-		CleanupInterval: time.Minute,
-		DefaultTTL:      time.Hour,
-	}
-
-	store, err := NewMemoryStore(config)
-	if err != nil {
-		t.Fatalf("Failed to create memory store: %v", err)
-	}
-	defer store.Close()
-
-	ctx := context.Background()
-
-	// Set more keys than the limit
+	// Add multiple expiring keys
 	for i := 0; i < 10; i++ {
-		key := fmt.Sprintf("key%d", i)
-		value := []byte(fmt.Sprintf("value%d", i))
-		if err := store.Set(ctx, key, value, time.Hour); err != nil {
-			t.Fatalf("Failed to set key%d: %v", i, err)
-		}
+		key := fmt.Sprintf("key_%d", i)
+		store.Set(ctx, key, []byte("value"), 500*time.Millisecond)
 	}
 
-	// Check that we don't exceed the limit
-	if size := store.Size(); size > config.MaxKeys {
-		t.Errorf("Expected store size to not exceed %d, got %d", config.MaxKeys, size)
-	}
-
-	// Check stats for evictions
+	// Verify they exist
 	stats := store.Stats()
-	if stats["evicted"].(int64) == 0 {
-		t.Error("Expected some keys to be evicted")
+	if stats.TotalKeys != 10 {
+		t.Errorf("expected 10 keys, got %d", stats.TotalKeys)
+	}
+
+	// Wait for cleanup to run (expiry + cleanup interval)
+	time.Sleep(1600 * time.Millisecond)
+
+	// Keys should be cleaned up
+	stats = store.Stats()
+	if stats.TotalKeys != 0 {
+		t.Errorf("expected 0 keys after cleanup, got %d", stats.TotalKeys)
 	}
 }
 
-func TestMemoryStore_ConcurrentAccess(t *testing.T) {
-	config := MemoryConfig{
-		MaxKeys:         10000,
-		CleanupInterval: time.Minute,
-		DefaultTTL:      time.Hour,
-	}
+// ============================================================================
+// CONCURRENCY TESTS
+// ============================================================================
 
-	store, err := NewMemoryStore(config)
+func TestMemoryStoreConcurrentWrites(t *testing.T) {
+	store, err := NewMemoryStore(nil)
 	if err != nil {
-		t.Fatalf("Failed to create memory store: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	defer store.Close()
 
 	ctx := context.Background()
 	var wg sync.WaitGroup
-	numGoroutines := 10
-	numOperations := 100
+	goroutines := 100
 
-	// Concurrent writes
-	wg.Add(numGoroutines)
-	for i := 0; i < numGoroutines; i++ {
-		go func(workerID int) {
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(id int) {
 			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
-				key := fmt.Sprintf("worker%d:key%d", workerID, j)
-				value := []byte(fmt.Sprintf("worker%d:value%d", workerID, j))
-				if err := store.Set(ctx, key, value, time.Hour); err != nil {
-					t.Errorf("Worker %d failed to set %s: %v", workerID, key, err)
-				}
-			}
+			key := fmt.Sprintf("concurrent_key_%d", id)
+			value := []byte(fmt.Sprintf("value_%d", id))
+			store.Set(ctx, key, value, 0)
 		}(i)
 	}
 
 	wg.Wait()
 
-	// Concurrent reads
-	wg.Add(numGoroutines)
-	for i := 0; i < numGoroutines; i++ {
-		go func(workerID int) {
-			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
-				key := fmt.Sprintf("worker%d:key%d", workerID, j)
-				expectedValue := fmt.Sprintf("worker%d:value%d", workerID, j)
-
-				value, err := store.Get(ctx, key)
-				if err != nil {
-					t.Errorf("Worker %d failed to get %s: %v", workerID, key, err)
-					continue
-				}
-
-				if string(value) != expectedValue {
-					t.Errorf("Worker %d got wrong value for %s: expected %s, got %s",
-						workerID, key, expectedValue, string(value))
-				}
-			}
-		}(i)
-	}
-
-	wg.Wait()
-
-	// Check final stats
+	// Verify all keys were written
 	stats := store.Stats()
-	totalExpectedKeys := numGoroutines * numOperations
-	actualKeys := stats["total_keys"].(int)
-
-	if actualKeys != totalExpectedKeys {
-		t.Errorf("Expected %d keys, got %d", totalExpectedKeys, actualKeys)
+	if stats.TotalKeys != goroutines {
+		t.Errorf("expected %d keys, got %d", goroutines, stats.TotalKeys)
 	}
 }
 
-func TestMemoryStore_Stats(t *testing.T) {
-	config := MemoryConfig{
-		MaxKeys:         1000,
+func TestMemoryStoreConcurrentIncrements(t *testing.T) {
+	store, err := NewMemoryStore(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	key := "concurrent_counter"
+	goroutines := 100
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			_, _ = store.Increment(ctx, key, 0)
+		}()
+	}
+
+	wg.Wait()
+
+	// Get final count
+	data, err := store.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Decode using binary encoding (new format)
+	var count int64
+	if len(data) >= 8 {
+		count = int64(binary.BigEndian.Uint64(data))
+	} else {
+		// Fallback to JSON for backward compatibility
+		json.Unmarshal(data, &count)
+	}
+
+	if count != int64(goroutines) {
+		t.Errorf("expected count %d, got %d", goroutines, count)
+	}
+}
+
+// ============================================================================
+// CLOSE TESTS
+// ============================================================================
+
+func TestMemoryStoreClose(t *testing.T) {
+	store, err := NewMemoryStore(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx := context.Background()
+	store.Set(ctx, "key", []byte("value"), 0)
+
+	// Close store
+	err = store.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Operations should fail after close
+	_, err = store.Get(ctx, "key")
+	if err != ratelimit.ErrClosed {
+		t.Errorf("expected ErrClosed, got %v", err)
+	}
+
+	// Double close should be safe
+	err = store.Close()
+	if err != nil {
+		t.Errorf("double close should not error: %v", err)
+	}
+}
+
+// ============================================================================
+// HEALTH TESTS
+// ============================================================================
+
+func TestMemoryStoreHealth(t *testing.T) {
+	store, err := NewMemoryStore(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	err = store.Health(ctx)
+	if err != nil {
+		t.Errorf("healthy store should return nil: %v", err)
+	}
+
+	// Close and check health
+	store.Close()
+	err = store.Health(ctx)
+	if err != ratelimit.ErrClosed {
+		t.Errorf("closed store should return ErrClosed: %v", err)
+	}
+}
+
+// ============================================================================
+// STATISTICS TESTS
+// ============================================================================
+
+func TestMemoryStoreStats(t *testing.T) {
+	config := &MemoryStoreConfig{
+		ShardCount:      8,
 		CleanupInterval: time.Minute,
-		DefaultTTL:      time.Hour,
+		MaxKeys:         0,
+		Logger:          ratelimit.NewNopLogger(),
 	}
 
 	store, err := NewMemoryStore(config)
 	if err != nil {
-		t.Fatalf("Failed to create memory store: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	defer store.Close()
 
 	ctx := context.Background()
 
-	// Perform some operations
-	store.Set(ctx, "key1", []byte("value1"), time.Hour)
-	store.Set(ctx, "key2", []byte("value2"), time.Hour)
-	store.Get(ctx, "key1") // hit
-	store.Get(ctx, "key3") // miss
-	store.Delete(ctx, "key2")
+	// Add some keys
+	for i := 0; i < 20; i++ {
+		key := fmt.Sprintf("stats_key_%d", i)
+		var expiration time.Duration
+		if i%2 == 0 {
+			expiration = time.Hour // Some with expiration
+		}
+		store.Set(ctx, key, []byte("value"), expiration)
+	}
 
 	stats := store.Stats()
-
-	// Check that stats are tracked
-	if stats["sets"].(int64) != 2 {
-		t.Errorf("Expected 2 sets, got %d", stats["sets"].(int64))
+	if stats.ShardCount != 8 {
+		t.Errorf("expected 8 shards, got %d", stats.ShardCount)
+	}
+	if stats.TotalKeys != 20 {
+		t.Errorf("expected 20 keys, got %d", stats.TotalKeys)
+	}
+	if stats.TotalExpiring != 10 {
+		t.Errorf("expected 10 expiring keys, got %d", stats.TotalExpiring)
+	}
+	if stats.Closed {
+		t.Error("store should not be closed")
 	}
 
-	if stats["gets"].(int64) != 2 {
-		t.Errorf("Expected 2 gets, got %d", stats["gets"].(int64))
+	// Test String method
+	str := store.String()
+	if len(str) == 0 {
+		t.Error("String() should not be empty")
+	}
+}
+
+// ============================================================================
+// CONFIGURATION TESTS
+// ============================================================================
+
+func TestMemoryStoreConfigValidation(t *testing.T) {
+	tests := []struct {
+		name      string
+		config    *MemoryStoreConfig
+		wantError bool
+	}{
+		{
+			name: "valid config",
+			config: &MemoryStoreConfig{
+				ShardCount:      4,
+				CleanupInterval: 10 * time.Second,
+				MaxKeys:         1000,
+				Logger:          ratelimit.NewNopLogger(),
+			},
+			wantError: false,
+		},
+		{
+			name: "invalid shard count",
+			config: &MemoryStoreConfig{
+				ShardCount:      0,
+				CleanupInterval: 10 * time.Second,
+				Logger:          ratelimit.NewNopLogger(),
+			},
+			wantError: true,
+		},
+		{
+			name: "invalid cleanup interval",
+			config: &MemoryStoreConfig{
+				ShardCount:      4,
+				CleanupInterval: 500 * time.Millisecond,
+				Logger:          ratelimit.NewNopLogger(),
+			},
+			wantError: true,
+		},
 	}
 
-	if stats["hits"].(int64) != 1 {
-		t.Errorf("Expected 1 hit, got %d", stats["hits"].(int64))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewMemoryStore(tt.config)
+			if (err != nil) != tt.wantError {
+				t.Errorf("NewMemoryStore() error = %v, wantError %v", err, tt.wantError)
+			}
+		})
 	}
+}
 
-	if stats["misses"].(int64) != 1 {
-		t.Errorf("Expected 1 miss, got %d", stats["misses"].(int64))
-	}
+// ============================================================================
+// BENCHMARK TESTS
+// ============================================================================
 
-	if stats["deletes"].(int64) != 1 {
-		t.Errorf("Expected 1 delete, got %d", stats["deletes"].(int64))
+func BenchmarkMemoryStoreSet(b *testing.B) {
+	store, _ := NewMemoryStore(nil)
+	defer store.Close()
+
+	ctx := context.Background()
+	value := []byte("benchmark_value")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := fmt.Sprintf("bench_key_%d", i)
+		store.Set(ctx, key, value, 0)
 	}
+}
+
+func BenchmarkMemoryStoreGet(b *testing.B) {
+	store, _ := NewMemoryStore(nil)
+	defer store.Close()
+
+	ctx := context.Background()
+	key := "bench_key"
+	value := []byte("benchmark_value")
+	store.Set(ctx, key, value, 0)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = store.Get(ctx, key)
+	}
+}
+
+func BenchmarkMemoryStoreIncrement(b *testing.B) {
+	store, _ := NewMemoryStore(nil)
+	defer store.Close()
+
+	ctx := context.Background()
+	key := "bench_counter"
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = store.Increment(ctx, key, 0)
+	}
+}
+
+func BenchmarkMemoryStoreConcurrentSet(b *testing.B) {
+	store, _ := NewMemoryStore(nil)
+	defer store.Close()
+
+	ctx := context.Background()
+	value := []byte("benchmark_value")
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			key := fmt.Sprintf("concurrent_bench_key_%d", i)
+			store.Set(ctx, key, value, 0)
+			i++
+		}
+	})
+}
+
+func BenchmarkMemoryStoreConcurrentIncrement(b *testing.B) {
+	store, _ := NewMemoryStore(nil)
+	defer store.Close()
+
+	ctx := context.Background()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_, _ = store.Increment(ctx, "concurrent_counter", 0)
+		}
+	})
 }

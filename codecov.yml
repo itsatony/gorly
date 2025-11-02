@@ -36,6 +36,4 @@ github_checks:
 ignore:
   - "**/*_test.go"
   - "**/testdata/**/*"
-  - "examples/**/*"
-  - "cmd/**/*"
   - "docs/**/*"

@@ -50,20 +50,110 @@ type SlidingWindowState struct {
 }
 
 // Allow checks if N requests are allowed within the sliding window
+// Uses atomic Lua script in Redis to prevent race conditions
 func (sw *SlidingWindowAlgorithm) Allow(ctx context.Context, store Store, key string, limit int64, window time.Duration, n int64) (*Result, error) {
-	if n <= 0 {
+	// Comprehensive input validation to prevent integer overflow and invalid inputs
+	if err := ValidateKey(key); err != nil {
 		return &Result{
 			Allowed:    false,
 			Remaining:  0,
 			RetryAfter: 0,
-			ResetTime:  time.Time{},
+			Algorithm:  sw.name,
+		}, NewRateLimitError("validation", err.Error(), err)
+	}
+
+	if err := ValidateAllowInputs(limit, window, n); err != nil {
+		return &Result{
+			Allowed:    false,
+			Remaining:  0,
+			RetryAfter: 0,
 			Limit:      limit,
 			Window:     window,
 			Used:       0,
 			Algorithm:  sw.name,
-		}, NewRateLimitError("validation", "request count must be greater than 0", nil)
+		}, NewRateLimitError("validation", err.Error(), err)
 	}
 
+	// Try atomic Lua script first (race-free)
+	result, err := sw.allowAtomic(ctx, store, key, limit, window, n)
+	if err == nil {
+		return result, nil
+	}
+
+	// If script not supported (memory store), fall back to non-atomic method
+	// WARNING: This has race conditions in concurrent scenarios
+	if !IsErrScriptNotSupported(err) {
+		return nil, err
+	}
+
+	// Fallback to non-atomic method for memory store
+	return sw.allowNonAtomic(ctx, store, key, limit, window, n)
+}
+
+// allowAtomic uses Redis Lua script for atomic rate limiting (no race conditions)
+func (sw *SlidingWindowAlgorithm) allowAtomic(ctx context.Context, store Store, key string, limit int64, window time.Duration, n int64) (*Result, error) {
+	now := time.Now()
+	nowNano := now.UnixNano()
+	windowNano := int64(window.Nanoseconds())
+	ttlSec := int64(window.Seconds()) * 2 // Keep state for 2x window
+
+	// Max trackable requests (safety limit to prevent memory exhaustion)
+	maxTrackableRequests := limit * 2
+	if maxTrackableRequests > 1000000 {
+		maxTrackableRequests = 1000000 // Hard cap at 1M to prevent DOS
+	}
+
+	// Execute atomic Lua script
+	// Returns: {allowed (1/0), remaining, current_count, reset_timestamp_nano}
+	scriptResult, err := store.ExecuteScript(ctx, SlidingWindowScript, []string{key},
+		limit,                // ARGV[1]
+		windowNano,           // ARGV[2]
+		n,                    // ARGV[3]
+		nowNano,              // ARGV[4]
+		ttlSec,               // ARGV[5]
+		maxTrackableRequests, // ARGV[6]
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse Lua result
+	results, ok := scriptResult.([]interface{})
+	if !ok || len(results) < 4 {
+		return nil, NewRateLimitError("algorithm", "invalid script result format", nil)
+	}
+
+	allowedInt := results[0].(int64)
+	remaining := results[1].(int64)
+	currentCount := results[2].(int64)
+	resetNano := results[3].(int64)
+
+	allowed := allowedInt == 1
+	resetTime := time.Unix(0, resetNano)
+
+	var retryAfter time.Duration
+	if !allowed {
+		retryAfter = resetTime.Sub(now)
+		if retryAfter < 0 {
+			retryAfter = 0
+		}
+	}
+
+	return &Result{
+		Allowed:    allowed,
+		Remaining:  remaining,
+		RetryAfter: retryAfter,
+		ResetTime:  resetTime,
+		Limit:      limit,
+		Window:     window,
+		Used:       currentCount,
+		Algorithm:  sw.name,
+	}, nil
+}
+
+// allowNonAtomic is the fallback non-atomic implementation for memory store
+// WARNING: This has race conditions in high-concurrency scenarios
+func (sw *SlidingWindowAlgorithm) allowNonAtomic(ctx context.Context, store Store, key string, limit int64, window time.Duration, n int64) (*Result, error) {
 	now := time.Now()
 	nowNano := now.UnixNano()
 	windowNano := int64(window.Nanoseconds())
@@ -79,6 +169,44 @@ func (sw *SlidingWindowAlgorithm) Allow(ctx context.Context, store Store, key st
 
 	// Calculate current usage
 	currentUsage := int64(len(state.Requests))
+
+	// Safety check: prevent unbounded memory growth
+	// This is critical for DOS prevention
+	maxTrackableRequests := limit * 2
+	if maxTrackableRequests > 1000000 {
+		maxTrackableRequests = 1000000 // Hard cap at 1M to prevent DOS
+	}
+
+	// If we've already hit the memory limit, deny the request
+	if currentUsage >= maxTrackableRequests {
+		state.DeniedRequests += n
+
+		// Save state with updated denied count
+		if err := sw.saveState(ctx, store, key, state, window); err != nil {
+			return nil, err
+		}
+
+		// Calculate reset time (oldest request + window)
+		var resetTime time.Time
+		if len(state.Requests) > 0 {
+			oldestRequest := state.Requests[0]
+			resetTime = time.Unix(0, oldestRequest+windowNano)
+		} else {
+			resetTime = now.Add(window)
+		}
+
+		return &Result{
+			Allowed:    false,
+			Remaining:  0,
+			RetryAfter: time.Duration(resetTime.UnixNano() - nowNano),
+			ResetTime:  resetTime,
+			Limit:      limit,
+			Window:     window,
+			Used:       currentUsage,
+			Algorithm:  sw.name,
+		}, nil
+	}
+
 	remaining := limit - currentUsage
 
 	// Check if request can be allowed
@@ -340,10 +468,23 @@ func (sw *SlidingWindowAlgorithm) cleanupExpiredRequests(state *SlidingWindowSta
 		return state.Requests[i] >= windowStart
 	})
 
-	// Remove expired requests
+	// Remove expired requests (before window start)
 	if cutoffIndex > 0 {
 		state.Requests = state.Requests[cutoffIndex:]
 	}
+
+	// Clock skew protection: Remove "future" timestamps
+	// These occur when the clock jumps backward after requests were recorded
+	// Example: Request at T=100, then clock jumps to T=50
+	// The timestamp 100 is now in the "future" and should be removed
+	validRequests := make([]int64, 0, len(state.Requests))
+	for _, ts := range state.Requests {
+		if ts <= nowNano {
+			validRequests = append(validRequests, ts)
+		}
+		// Silently drop future timestamps - they're from before clock skew
+	}
+	state.Requests = validRequests
 
 	return state
 }

@@ -1,126 +1,229 @@
-// Package ratelimit version information
+// Package ratelimit version information using go-version
 package ratelimit
 
 import (
+	"context"
 	"fmt"
-	"runtime"
+	"net/http"
+
+	version "github.com/itsatony/go-version"
 )
 
-const (
-	// Version is the current version of Gorly
-	Version = "1.0.0"
+var (
+	// versionInfo stores the lazily initialized version information
+	versionInfo *version.Info
 
-	// Name is the library name
-	Name = "Gorly"
-
-	// Description is a short description of the library
-	Description = "World-class Go rate limiting library with revolutionary developer experience"
+	// initError stores any initialization error
+	initError error
 )
 
-// VersionInfo contains comprehensive version information
-type VersionInfo struct {
-	Version     string `json:"version"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	GoVersion   string `json:"go_version"`
-	GitCommit   string `json:"git_commit,omitempty"` // Set at build time
-	BuildTime   string `json:"build_time,omitempty"` // Set at build time
-	BuildUser   string `json:"build_user,omitempty"` // Set at build time
+// InitializeVersion initializes the version information from the manifest
+// This should be called once during application startup
+func InitializeVersion(opts ...version.Option) error {
+	// Add manifest path and git/build info by default
+	defaultOpts := []version.Option{
+		version.WithManifestPath("versions.yaml"),
+		version.WithGitInfo(),
+		version.WithBuildInfo(),
+	}
+
+	// Append user-provided options
+	allOpts := append(defaultOpts, opts...)
+
+	err := version.Initialize(allOpts...)
+	if err != nil {
+		initError = err
+		return fmt.Errorf("failed to initialize version: %w", err)
+	}
+
+	versionInfo = version.MustGet()
+	return nil
 }
 
 // GetVersion returns the current version string
 func GetVersion() string {
-	return Version
+	if versionInfo == nil {
+		_ = InitializeVersion()
+	}
+	if versionInfo != nil {
+		return versionInfo.Project.Version
+	}
+	return "unknown"
 }
 
 // GetVersionInfo returns comprehensive version information
-func GetVersionInfo() *VersionInfo {
-	return &VersionInfo{
-		Version:     Version,
-		Name:        Name,
-		Description: Description,
-		GoVersion:   runtime.Version(),
-		GitCommit:   gitCommit, // Set via ldflags at build time
-		BuildTime:   buildTime, // Set via ldflags at build time
-		BuildUser:   buildUser, // Set via ldflags at build time
+// Initializes version info if not already done
+func GetVersionInfo() *version.Info {
+	if versionInfo == nil {
+		_ = InitializeVersion()
 	}
+	return versionInfo
 }
 
-// String returns a formatted version string
-func (v *VersionInfo) String() string {
-	base := fmt.Sprintf("%s v%s (%s)", v.Name, v.Version, v.GoVersion)
-
-	if v.GitCommit != "" {
-		if len(v.GitCommit) > 7 {
-			base += fmt.Sprintf(" [%s]", v.GitCommit[:7])
-		} else {
-			base += fmt.Sprintf(" [%s]", v.GitCommit)
-		}
+// MustGetVersionInfo returns version information or panics if unavailable
+func MustGetVersionInfo() *version.Info {
+	info := GetVersionInfo()
+	if info == nil {
+		panic("version information not available")
 	}
-
-	if v.BuildTime != "" {
-		base += fmt.Sprintf(" built %s", v.BuildTime)
-	}
-
-	if v.BuildUser != "" {
-		base += fmt.Sprintf(" by %s", v.BuildUser)
-	}
-
-	return base
+	return info
 }
 
-// Banner returns a styled version banner for CLI tools
-func (v *VersionInfo) Banner() string {
-	return fmt.Sprintf(`
-🚀 %s v%s
-   %s
-   
-   Go Version: %s
-   Build Info: %s
-   
-   One line = Magic ✨
-`, v.Name, v.Version, v.Description, v.GoVersion, func() string {
-		if v.GitCommit != "" || v.BuildTime != "" {
-			commit := "unknown"
-			if v.GitCommit != "" {
-				if len(v.GitCommit) > 7 {
-					commit = v.GitCommit[:7]
-				} else {
-					commit = v.GitCommit
-				}
-			}
-
-			buildTime := "unknown"
-			if v.BuildTime != "" {
-				buildTime = v.BuildTime
-			}
-
-			return fmt.Sprintf("commit %s, built %s", commit, buildTime)
-		}
-		return "development build"
-	}())
+// GetProjectName returns the project name
+func GetProjectName() string {
+	if versionInfo == nil {
+		_ = InitializeVersion()
+	}
+	if versionInfo != nil {
+		return versionInfo.Project.Name
+	}
+	return "gorly"
 }
 
-// Variables set at build time via ldflags
-var (
-	gitCommit = "unknown" // Set with: -ldflags "-X github.com/itsatony/gorly.gitCommit=<commit>"
-	buildTime = "unknown" // Set with: -ldflags "-X github.com/itsatony/gorly.buildTime=<timestamp>"
-	buildUser = "unknown" // Set with: -ldflags "-X github.com/itsatony/gorly.buildUser=<user>"
-)
-
-// Build-time information functions for advanced use cases
-
-// GetGitCommit returns the git commit hash (if set at build time)
+// GetGitCommit returns the git commit hash
 func GetGitCommit() string {
-	return gitCommit
+	if versionInfo == nil {
+		_ = InitializeVersion()
+	}
+	if versionInfo != nil && versionInfo.Git.Commit != "" {
+		return versionInfo.Git.Commit
+	}
+	return "unknown"
 }
 
-// GetBuildTime returns the build timestamp (if set at build time)
-func GetBuildTime() string {
-	return buildTime
+// GetAPIVersion returns the version of a specific API
+func GetAPIVersion(apiName string) (string, error) {
+	if versionInfo == nil {
+		_ = InitializeVersion()
+	}
+	if versionInfo == nil {
+		return "", fmt.Errorf("version information not available")
+	}
+
+	v, exists := versionInfo.GetAPIVersion(apiName)
+	if !exists {
+		return "", fmt.Errorf("API '%s' not found in manifest", apiName)
+	}
+
+	return v, nil
 }
 
-// GetBuildUser returns who built the binary (if set at build time)
-func GetBuildUser() string {
-	return buildUser
+// GetComponentVersion returns the version of a specific component
+func GetComponentVersion(componentName string) (string, error) {
+	if versionInfo == nil {
+		_ = InitializeVersion()
+	}
+	if versionInfo == nil {
+		return "", fmt.Errorf("version information not available")
+	}
+
+	v, exists := versionInfo.GetComponentVersion(componentName)
+	if !exists {
+		return "", fmt.Errorf("component '%s' not found in manifest", componentName)
+	}
+
+	return v, nil
+}
+
+// GetSchemaVersion returns the version of a specific schema
+func GetSchemaVersion(schemaName string) (string, error) {
+	if versionInfo == nil {
+		_ = InitializeVersion()
+	}
+	if versionInfo == nil {
+		return "", fmt.Errorf("version information not available")
+	}
+
+	v, exists := versionInfo.GetSchemaVersion(schemaName)
+	if !exists {
+		return "", fmt.Errorf("schema '%s' not found in manifest", schemaName)
+	}
+
+	return v, nil
+}
+
+// FormatVersionString returns a formatted version string with additional info
+func FormatVersionString() string {
+	if versionInfo == nil {
+		_ = InitializeVersion()
+	}
+	if versionInfo == nil {
+		return "gorly version unknown"
+	}
+
+	result := fmt.Sprintf("%s v%s", versionInfo.Project.Name, versionInfo.Project.Version)
+
+	if versionInfo.Git.Commit != "" && versionInfo.Git.Commit != "unknown" {
+		// Show first 8 characters of commit hash
+		commitHash := versionInfo.Git.Commit
+		if len(commitHash) > 8 {
+			commitHash = commitHash[:8]
+		}
+		result += fmt.Sprintf(" (commit: %s)", commitHash)
+	}
+
+	if versionInfo.Build.Time != "" {
+		result += fmt.Sprintf(" built: %s", versionInfo.Build.Time)
+	}
+
+	return result
+}
+
+// VersionHandler returns an HTTP handler that exposes version information
+// This uses the go-version package's built-in handler
+func VersionHandler() http.Handler {
+	if versionInfo == nil {
+		_ = InitializeVersion()
+	}
+	return version.Handler()
+}
+
+// VersionHandlerFunc returns an HTTP handler function that exposes version information
+func VersionHandlerFunc() http.HandlerFunc {
+	if versionInfo == nil {
+		_ = InitializeVersion()
+	}
+	return version.HandlerFunc()
+}
+
+// VersionMiddleware returns middleware that adds version information to the context
+func VersionMiddleware(next http.Handler) http.Handler {
+	if versionInfo == nil {
+		_ = InitializeVersion()
+	}
+	return version.Middleware(next)
+}
+
+// HealthHandler returns an HTTP handler for health checks with version info
+func HealthHandler() http.Handler {
+	if versionInfo == nil {
+		_ = InitializeVersion()
+	}
+	return version.HealthHandler()
+}
+
+// ValidateVersions validates that all components meet minimum version requirements
+// This is useful for ensuring compatibility during initialization
+func ValidateVersions(ctx context.Context, validators ...version.Validator) error {
+	if versionInfo == nil {
+		_ = InitializeVersion()
+	}
+	if versionInfo == nil {
+		return fmt.Errorf("version information not available")
+	}
+
+	for _, validator := range validators {
+		if err := validator.Validate(ctx, versionInfo); err != nil {
+			return fmt.Errorf("version validation failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// ResetVersion resets the version information (useful for testing)
+func ResetVersion() {
+	version.Reset()
+	versionInfo = nil
+	initError = nil
 }

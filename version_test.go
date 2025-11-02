@@ -1,231 +1,421 @@
 package ratelimit
 
 import (
-	"runtime"
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	version "github.com/itsatony/go-version"
 )
 
+func TestInitializeVersion(t *testing.T) {
+	defer ResetVersion()
+
+	err := InitializeVersion()
+	if err != nil {
+		t.Fatalf("InitializeVersion failed: %v", err)
+	}
+
+	if versionInfo == nil {
+		t.Error("versionInfo should be initialized")
+	}
+}
+
 func TestGetVersion(t *testing.T) {
-	version := GetVersion()
+	defer ResetVersion()
 
-	if version == "" {
-		t.Error("Version should not be empty")
+	v := GetVersion()
+	if v == "" {
+		t.Error("GetVersion returned empty string")
+	}
+	if v == "unknown" {
+		t.Error("GetVersion returned 'unknown', expected valid version")
 	}
 
-	// Version should follow semantic versioning pattern
-	if !strings.Contains(version, ".") {
-		t.Error("Version should contain dots (semantic versioning)")
-	}
-
-	if version != Version {
-		t.Errorf("GetVersion() should return Version constant, got %s, expected %s", version, Version)
+	// Should be semver format
+	if !strings.Contains(v, ".") {
+		t.Errorf("GetVersion returned invalid semver format: %s", v)
 	}
 }
 
 func TestGetVersionInfo(t *testing.T) {
-	info := GetVersionInfo()
+	defer ResetVersion()
 
+	info := GetVersionInfo()
 	if info == nil {
-		t.Fatal("GetVersionInfo() should not return nil")
+		t.Fatal("GetVersionInfo returned nil")
 	}
 
-	// Check required fields
-	if info.Version == "" {
-		t.Error("VersionInfo.Version should not be empty")
+	if info.Project.Name != "gorly" {
+		t.Errorf("Expected project name 'gorly', got '%s'", info.Project.Name)
 	}
 
-	if info.Name == "" {
-		t.Error("VersionInfo.Name should not be empty")
-	}
-
-	if info.Description == "" {
-		t.Error("VersionInfo.Description should not be empty")
-	}
-
-	if info.GoVersion == "" {
-		t.Error("VersionInfo.GoVersion should not be empty")
-	}
-
-	// Verify Go version format
-	if !strings.HasPrefix(info.GoVersion, "go") {
-		t.Error("GoVersion should start with 'go'")
-	}
-
-	// Check that GoVersion matches runtime
-	if info.GoVersion != runtime.Version() {
-		t.Errorf("GoVersion should match runtime.Version(), got %s, expected %s",
-			info.GoVersion, runtime.Version())
+	if info.Project.Version == "" {
+		t.Error("Project version should not be empty")
 	}
 }
 
-func TestVersionInfoString(t *testing.T) {
-	info := GetVersionInfo()
-	str := info.String()
+func TestMustGetVersionInfo(t *testing.T) {
+	defer ResetVersion()
 
-	if str == "" {
-		t.Error("VersionInfo.String() should not be empty")
-	}
+	// Should not panic with valid initialization
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("MustGetVersionInfo panicked unexpectedly: %v", r)
+		}
+	}()
 
-	// Should contain key information
-	if !strings.Contains(str, info.Name) {
-		t.Error("String representation should contain name")
-	}
-
-	if !strings.Contains(str, info.Version) {
-		t.Error("String representation should contain version")
-	}
-
-	if !strings.Contains(str, info.GoVersion) {
-		t.Error("String representation should contain Go version")
+	info := MustGetVersionInfo()
+	if info == nil {
+		t.Error("MustGetVersionInfo returned nil without panicking")
 	}
 }
 
-func TestVersionInfoBanner(t *testing.T) {
-	info := GetVersionInfo()
-	banner := info.Banner()
+func TestGetProjectName(t *testing.T) {
+	defer ResetVersion()
 
-	if banner == "" {
-		t.Error("VersionInfo.Banner() should not be empty")
+	name := GetProjectName()
+	if name == "" {
+		t.Error("GetProjectName returned empty string")
 	}
-
-	// Should contain key information
-	if !strings.Contains(banner, info.Name) {
-		t.Error("Banner should contain name")
-	}
-
-	if !strings.Contains(banner, info.Version) {
-		t.Error("Banner should contain version")
-	}
-
-	if !strings.Contains(banner, info.Description) {
-		t.Error("Banner should contain description")
-	}
-
-	// Should contain emoji/styling
-	if !strings.Contains(banner, "🚀") {
-		t.Error("Banner should contain rocket emoji for styling")
-	}
-
-	if !strings.Contains(banner, "✨") {
-		t.Error("Banner should contain sparkles emoji")
+	if name != "gorly" {
+		t.Errorf("Expected 'gorly', got '%s'", name)
 	}
 }
 
-func TestVersionConstants(t *testing.T) {
-	// Test that constants are set to reasonable values
-	if Version == "" {
-		t.Error("Version constant should not be empty")
-	}
+func TestGetGitCommit(t *testing.T) {
+	defer ResetVersion()
 
-	if Name == "" {
-		t.Error("Name constant should not be empty")
-	}
-
-	if Description == "" {
-		t.Error("Description constant should not be empty")
-	}
-
-	// Version should follow semantic versioning
-	parts := strings.Split(Version, ".")
-	if len(parts) != 3 {
-		t.Errorf("Version should have 3 parts (semantic versioning), got %d parts in %s", len(parts), Version)
-	}
-}
-
-func TestBuildTimeVariables(t *testing.T) {
-	// These will be "unknown" in tests since they're set at build time
 	commit := GetGitCommit()
-	buildTime := GetBuildTime()
-	buildUser := GetBuildUser()
-
-	// Should at least return something (even if "unknown")
 	if commit == "" {
-		t.Error("GetGitCommit() should return a value (even if 'unknown')")
+		t.Error("GetGitCommit returned empty string")
 	}
-
-	if buildTime == "" {
-		t.Error("GetBuildTime() should return a value (even if 'unknown')")
-	}
-
-	if buildUser == "" {
-		t.Error("GetBuildUser() should return a value (even if 'unknown')")
+	// Should return "unknown" or a valid commit hash
+	if commit != "unknown" && len(commit) < 7 {
+		t.Errorf("GetGitCommit returned invalid commit: %s", commit)
 	}
 }
 
-func TestVersionStringFunction(t *testing.T) {
-	// Test the exported VersionString function variable
-	version := VersionString()
+func TestGetAPIVersion(t *testing.T) {
+	defer ResetVersion()
 
-	if version != GetVersion() {
-		t.Errorf("VersionString() should return same as GetVersion(), got %s, expected %s",
-			version, GetVersion())
+	tests := []struct {
+		name        string
+		apiName     string
+		expectError bool
+	}{
+		{
+			name:        "valid API",
+			apiName:     "http_middleware",
+			expectError: false,
+		},
+		{
+			name:        "non-existent API",
+			apiName:     "nonexistent_api",
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v, err := GetAPIVersion(tt.apiName)
+			if tt.expectError {
+				if err == nil {
+					t.Error("Expected error for non-existent API")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("GetAPIVersion failed: %v", err)
+				}
+				if v == "" {
+					t.Error("API version should not be empty")
+				}
+			}
+		})
 	}
 }
 
-func TestInfoFunction(t *testing.T) {
-	// Test the exported Info function variable
-	info := Info()
+func TestGetComponentVersion(t *testing.T) {
+	defer ResetVersion()
 
-	if info == nil {
-		t.Fatal("Info() should not return nil")
+	tests := []struct {
+		name          string
+		componentName string
+		expectError   bool
+	}{
+		{
+			name:          "algorithms component",
+			componentName: "algorithms",
+			expectError:   false,
+		},
+		{
+			name:          "stores component",
+			componentName: "stores",
+			expectError:   false,
+		},
+		{
+			name:          "middleware component",
+			componentName: "middleware",
+			expectError:   false,
+		},
+		{
+			name:          "non-existent component",
+			componentName: "nonexistent",
+			expectError:   true,
+		},
 	}
 
-	expected := GetVersionInfo()
-	if info.Version != expected.Version {
-		t.Errorf("Info() should return same as GetVersionInfo(), got version %s, expected %s",
-			info.Version, expected.Version)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v, err := GetComponentVersion(tt.componentName)
+			if tt.expectError {
+				if err == nil {
+					t.Error("Expected error for non-existent component")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("GetComponentVersion failed: %v", err)
+				}
+				if v == "" {
+					t.Error("Component version should not be empty")
+				}
+			}
+		})
 	}
 }
 
-// Test version functionality under different build scenarios
-func TestVersionWithBuildInfo(t *testing.T) {
-	// Save original values
-	originalCommit := gitCommit
-	originalBuildTime := buildTime
-	originalBuildUser := buildUser
+func TestGetSchemaVersion(t *testing.T) {
+	defer ResetVersion()
 
-	// Test with simulated build info
-	gitCommit = "abc123def456"
-	buildTime = "2024-01-15T10:30:00Z"
-	buildUser = "ci-system"
-
-	info := GetVersionInfo()
-
-	if info.GitCommit != "abc123def456" {
-		t.Errorf("Expected GitCommit to be abc123def456, got %s", info.GitCommit)
+	tests := []struct {
+		name        string
+		schemaName  string
+		expectError bool
+	}{
+		{
+			name:        "rate_limit_config schema",
+			schemaName:  "rate_limit_config",
+			expectError: false,
+		},
+		{
+			name:        "non-existent schema",
+			schemaName:  "nonexistent_schema",
+			expectError: true,
+		},
 	}
 
-	if info.BuildTime != "2024-01-15T10:30:00Z" {
-		t.Errorf("Expected BuildTime to be 2024-01-15T10:30:00Z, got %s", info.BuildTime)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v, err := GetSchemaVersion(tt.schemaName)
+			if tt.expectError {
+				if err == nil {
+					t.Error("Expected error for non-existent schema")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("GetSchemaVersion failed: %v", err)
+				}
+				if v == "" {
+					t.Error("Schema version should not be empty")
+				}
+			}
+		})
+	}
+}
+
+func TestFormatVersionString(t *testing.T) {
+	defer ResetVersion()
+
+	formatted := FormatVersionString()
+	if formatted == "" {
+		t.Error("FormatVersionString returned empty string")
 	}
 
-	if info.BuildUser != "ci-system" {
-		t.Errorf("Expected BuildUser to be ci-system, got %s", info.BuildUser)
+	// Should contain project name
+	if !strings.Contains(formatted, "gorly") {
+		t.Errorf("Expected formatted string to contain 'gorly', got: %s", formatted)
 	}
 
-	// Test string representation includes build info
-	str := info.String()
-	if !strings.Contains(str, "abc123d") { // Shortened commit
-		t.Error("String representation should contain shortened commit hash")
+	// Should contain version number
+	if !strings.Contains(formatted, "v") {
+		t.Errorf("Expected formatted string to contain version, got: %s", formatted)
+	}
+}
+
+func TestVersionHandler(t *testing.T) {
+	defer ResetVersion()
+
+	handler := VersionHandler()
+	if handler == nil {
+		t.Fatal("VersionHandler returned nil")
 	}
 
-	if !strings.Contains(str, "2024-01-15T10:30:00Z") {
-		t.Error("String representation should contain build time")
+	req := httptest.NewRequest(http.MethodGet, "/version", nil)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", w.Code)
 	}
 
-	if !strings.Contains(str, "ci-system") {
-		t.Error("String representation should contain build user")
+	body := w.Body.String()
+	if body == "" {
+		t.Error("Response body should not be empty")
 	}
 
-	// Test banner includes build info
-	banner := info.Banner()
-	if !strings.Contains(banner, "abc123d") {
-		t.Error("Banner should contain shortened commit hash")
+	// Should contain JSON with version info
+	if !strings.Contains(body, "version") {
+		t.Errorf("Expected JSON response to contain 'version', got: %s", body)
+	}
+}
+
+func TestVersionHandlerFunc(t *testing.T) {
+	defer ResetVersion()
+
+	handlerFunc := VersionHandlerFunc()
+	if handlerFunc == nil {
+		t.Fatal("VersionHandlerFunc returned nil")
 	}
 
-	// Restore original values
-	gitCommit = originalCommit
-	buildTime = originalBuildTime
-	buildUser = originalBuildUser
+	req := httptest.NewRequest(http.MethodGet, "/version", nil)
+	w := httptest.NewRecorder()
+
+	handlerFunc(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", w.Code)
+	}
+}
+
+func TestVersionMiddleware(t *testing.T) {
+	defer ResetVersion()
+
+	// Create a test handler
+	nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
+	middleware := VersionMiddleware(nextHandler)
+	if middleware == nil {
+		t.Fatal("VersionMiddleware returned nil")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	w := httptest.NewRecorder()
+
+	middleware.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", w.Code)
+	}
+}
+
+func TestHealthHandler(t *testing.T) {
+	defer ResetVersion()
+
+	handler := HealthHandler()
+	if handler == nil {
+		t.Fatal("HealthHandler returned nil")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", w.Code)
+	}
+
+	body := w.Body.String()
+	if body == "" {
+		t.Error("Response body should not be empty")
+	}
+}
+
+func TestValidateVersions(t *testing.T) {
+	defer ResetVersion()
+
+	ctx := context.Background()
+
+	// Test with valid validators
+	t.Run("valid component validator", func(t *testing.T) {
+		validator := version.NewComponentValidator("algorithms", "0.1.0")
+		err := ValidateVersions(ctx, validator)
+		if err != nil {
+			t.Errorf("ValidateVersions failed with valid validator: %v", err)
+		}
+	})
+
+	// Test with strict version requirement
+	t.Run("component with minimum version", func(t *testing.T) {
+		validator := version.NewComponentValidator("stores", "0.5.0")
+		err := ValidateVersions(ctx, validator)
+		if err != nil {
+			t.Errorf("ValidateVersions failed: %v", err)
+		}
+	})
+}
+
+func TestResetVersion(t *testing.T) {
+	// Initialize version first
+	_ = InitializeVersion()
+	if versionInfo == nil {
+		t.Fatal("versionInfo should be initialized")
+	}
+
+	// Reset
+	ResetVersion()
+
+	if versionInfo != nil {
+		t.Error("versionInfo should be nil after Reset")
+	}
+	if initError != nil {
+		t.Error("initError should be nil after Reset")
+	}
+}
+
+func TestVersionInitializationLazy(t *testing.T) {
+	defer ResetVersion()
+
+	// Don't explicitly initialize, let it happen lazily
+	v := GetVersion()
+	if v == "" || v == "unknown" {
+		t.Error("Lazy initialization should have occurred")
+	}
+
+	if versionInfo == nil {
+		t.Error("versionInfo should be initialized after lazy load")
+	}
+}
+
+func TestMultipleInitializations(t *testing.T) {
+	defer ResetVersion()
+
+	// First initialization
+	err1 := InitializeVersion()
+	if err1 != nil {
+		t.Fatalf("First initialization failed: %v", err1)
+	}
+
+	v1 := GetVersion()
+
+	// Reset before second initialization (singleton pattern requires this)
+	ResetVersion()
+
+	// Second initialization (after reset)
+	err2 := InitializeVersion()
+	if err2 != nil {
+		t.Errorf("Second initialization failed: %v", err2)
+	}
+
+	v2 := GetVersion()
+
+	if v1 != v2 {
+		t.Error("Version should be consistent across multiple initializations")
+	}
 }

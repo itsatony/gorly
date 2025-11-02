@@ -1,385 +1,352 @@
-// Package ratelimit provides comprehensive typed error handling
 package ratelimit
 
 import (
 	"errors"
 	"fmt"
-	"time"
+
+	"github.com/itsatony/go-cuserr"
 )
 
-// ErrorCode represents specific error types
-type ErrorCode string
+// ============================================================================
+// SENTINEL ERRORS - Predefined error constants
+// ============================================================================
 
-const (
-	// Configuration errors
-	ErrCodeInvalidLimit     ErrorCode = "INVALID_LIMIT"
-	ErrCodeInvalidAlgorithm ErrorCode = "INVALID_ALGORITHM"
-	ErrCodeInvalidConfig    ErrorCode = "INVALID_CONFIG"
-	ErrCodeMissingConfig    ErrorCode = "MISSING_CONFIG"
-
-	// Connection errors
-	ErrCodeRedisConnection  ErrorCode = "REDIS_CONNECTION"
-	ErrCodeRedisTimeout     ErrorCode = "REDIS_TIMEOUT"
-	ErrCodeRedisAuth        ErrorCode = "REDIS_AUTH"
-	ErrCodeStoreUnavailable ErrorCode = "STORE_UNAVAILABLE"
-
-	// Rate limiting errors
-	ErrCodeRateLimitExceeded ErrorCode = "RATE_LIMIT_EXCEEDED"
-	ErrCodeQuotaExceeded     ErrorCode = "QUOTA_EXCEEDED"
-	ErrCodeWindowExpired     ErrorCode = "WINDOW_EXPIRED"
-	ErrCodeInvalidEntity     ErrorCode = "INVALID_ENTITY"
-	ErrCodeInvalidScope      ErrorCode = "INVALID_SCOPE"
-
-	// System errors
-	ErrCodeInternalError  ErrorCode = "INTERNAL_ERROR"
-	ErrCodeTimeout        ErrorCode = "TIMEOUT"
-	ErrCodeUnavailable    ErrorCode = "UNAVAILABLE"
-	ErrCodeNotInitialized ErrorCode = "NOT_INITIALIZED"
-
-	// Middleware errors
-	ErrCodeFrameworkNotSupported ErrorCode = "FRAMEWORK_NOT_SUPPORTED"
-	ErrCodeMiddlewareError       ErrorCode = "MIDDLEWARE_ERROR"
-)
-
-// AdvancedRateLimitError represents a comprehensive rate limiting error
-type AdvancedRateLimitError struct {
-	Code      ErrorCode              `json:"code"`
-	Message   string                 `json:"message"`
-	Details   string                 `json:"details,omitempty"`
-	Cause     error                  `json:"cause,omitempty"`
-	Timestamp time.Time              `json:"timestamp"`
-	Context   map[string]interface{} `json:"context,omitempty"`
-
-	// Rate limiting specific fields
-	Entity     string        `json:"entity,omitempty"`
-	Scope      string        `json:"scope,omitempty"`
-	Limit      int64         `json:"limit,omitempty"`
-	Used       int64         `json:"used,omitempty"`
-	Remaining  int64         `json:"remaining,omitempty"`
-	RetryAfter time.Duration `json:"retry_after,omitempty"`
-	ResetTime  time.Time     `json:"reset_time,omitempty"`
-
-	// Suggestions for resolution
-	Suggestions []string `json:"suggestions,omitempty"`
-}
-
-// Error implements the error interface
-func (e *AdvancedRateLimitError) Error() string {
-	if e.Details != "" {
-		return fmt.Sprintf("[%s] %s: %s", e.Code, e.Message, e.Details)
-	}
-	return fmt.Sprintf("[%s] %s", e.Code, e.Message)
-}
-
-// Is implements error matching for errors.Is()
-func (e *AdvancedRateLimitError) Is(target error) bool {
-	if t, ok := target.(*AdvancedRateLimitError); ok {
-		return e.Code == t.Code
-	}
-	return false
-}
-
-// Unwrap implements error unwrapping for errors.Unwrap()
-func (e *AdvancedRateLimitError) Unwrap() error {
-	return e.Cause
-}
-
-// WithContext adds context information to the error
-func (e *AdvancedRateLimitError) WithContext(key string, value interface{}) *AdvancedRateLimitError {
-	if e.Context == nil {
-		e.Context = make(map[string]interface{})
-	}
-	e.Context[key] = value
-	return e
-}
-
-// WithSuggestion adds a suggestion for error resolution
-func (e *AdvancedRateLimitError) WithSuggestion(suggestion string) *AdvancedRateLimitError {
-	e.Suggestions = append(e.Suggestions, suggestion)
-	return e
-}
-
-// IsRetryable returns whether the error condition is retryable
-func (e *AdvancedRateLimitError) IsRetryable() bool {
-	switch e.Code {
-	case ErrCodeRateLimitExceeded, ErrCodeQuotaExceeded, ErrCodeTimeout,
-		ErrCodeStoreUnavailable, ErrCodeRedisTimeout, ErrCodeUnavailable:
-		return true
-	default:
-		return false
-	}
-}
-
-// ShouldCircuitBreak returns whether this error should trigger circuit breaker
-func (e *AdvancedRateLimitError) ShouldCircuitBreak() bool {
-	switch e.Code {
-	case ErrCodeStoreUnavailable, ErrCodeRedisConnection, ErrCodeUnavailable:
-		return true
-	default:
-		return false
-	}
-}
-
-// HTTPStatusCode returns the appropriate HTTP status code for this error
-func (e *AdvancedRateLimitError) HTTPStatusCode() int {
-	switch e.Code {
-	case ErrCodeRateLimitExceeded, ErrCodeQuotaExceeded:
-		return 429 // Too Many Requests
-	case ErrCodeInvalidEntity, ErrCodeInvalidScope, ErrCodeInvalidConfig:
-		return 400 // Bad Request
-	case ErrCodeRedisAuth:
-		return 401 // Unauthorized
-	case ErrCodeTimeout, ErrCodeStoreUnavailable, ErrCodeUnavailable:
-		return 503 // Service Unavailable
-	case ErrCodeFrameworkNotSupported:
-		return 501 // Not Implemented
-	default:
-		return 500 // Internal Server Error
-	}
-}
-
-// Error constructor functions
-
-// NewAdvancedRateLimitError creates a new rate limit error
-func NewAdvancedRateLimitError(code ErrorCode, message string) *AdvancedRateLimitError {
-	return &AdvancedRateLimitError{
-		Code:      code,
-		Message:   message,
-		Timestamp: time.Now(),
-	}
-}
-
-// NewRateLimitExceededError creates a rate limit exceeded error
-func NewRateLimitExceededError(entity, scope string, limit, used int64, retryAfter time.Duration) *AdvancedRateLimitError {
-	err := &AdvancedRateLimitError{
-		Code:       ErrCodeRateLimitExceeded,
-		Message:    fmt.Sprintf("Rate limit exceeded for %s in scope %s", entity, scope),
-		Timestamp:  time.Now(),
-		Entity:     entity,
-		Scope:      scope,
-		Limit:      limit,
-		Used:       used,
-		Remaining:  max(0, limit-used),
-		RetryAfter: retryAfter,
-		ResetTime:  time.Now().Add(retryAfter),
-	}
-
-	// Add helpful suggestions
-	if retryAfter < time.Minute {
-		err.WithSuggestion(fmt.Sprintf("Wait %v before retrying", retryAfter))
-	} else {
-		err.WithSuggestion("Consider upgrading to a higher tier for increased limits")
-	}
-
-	if scope != "global" {
-		err.WithSuggestion("Try using a different endpoint with separate limits")
-	}
-
-	return err
-}
-
-// NewConfigError creates a configuration error
-func NewConfigError(code ErrorCode, message, details string) *AdvancedRateLimitError {
-	err := NewAdvancedRateLimitError(code, message)
-	err.Details = details
-
-	switch code {
-	case ErrCodeInvalidLimit:
-		err.WithSuggestion("Use format like '100/minute', '10/second', '1000/hour'")
-		err.WithSuggestion("Supported units: second, minute, hour, day")
-	case ErrCodeInvalidAlgorithm:
-		err.WithSuggestion("Supported algorithms: token_bucket, sliding_window")
-	case ErrCodeInvalidConfig:
-		err.WithSuggestion("Check the builder configuration for missing required fields")
-	}
-
-	return err
-}
-
-// NewRedisError creates a Redis-related error
-func NewRedisError(code ErrorCode, message string, cause error) *AdvancedRateLimitError {
-	err := NewAdvancedRateLimitError(code, message)
-	err.Cause = cause
-
-	switch code {
-	case ErrCodeRedisConnection:
-		err.WithSuggestion("Check Redis server is running and accessible")
-		err.WithSuggestion("Verify connection string format: 'localhost:6379'")
-		err.WithSuggestion("Check network connectivity and firewall rules")
-	case ErrCodeRedisAuth:
-		err.WithSuggestion("Verify Redis password is correct")
-		err.WithSuggestion("Ensure Redis is configured to require authentication")
-	case ErrCodeRedisTimeout:
-		err.WithSuggestion("Increase timeout value or check Redis performance")
-		err.WithSuggestion("Consider using connection pooling")
-	}
-
-	return err
-}
-
-// NewInternalError creates an internal error
-func NewInternalError(message string, cause error) *AdvancedRateLimitError {
-	return &AdvancedRateLimitError{
-		Code:      ErrCodeInternalError,
-		Message:   message,
-		Cause:     cause,
-		Timestamp: time.Now(),
-	}
-}
-
-// Predefined common errors
+// Core sentinel errors using standard errors package
+// These are wrapped with cuserr when additional context is needed
 var (
-	ErrInvalidLimitFormat = NewConfigError(ErrCodeInvalidLimit,
-		"Invalid limit format",
-		"Limit must be in format 'number/unit' like '100/minute'")
+	// ErrInvalidConfig indicates the rate limiter configuration is invalid
+	ErrInvalidConfig = errors.New(ErrMsgInvalidConfig)
 
-	ErrAlgorithmNotSupported = NewConfigError(ErrCodeInvalidAlgorithm,
-		"Algorithm not supported",
-		"Supported algorithms: token_bucket, sliding_window")
+	// ErrInvalidContext indicates the rate limit context is invalid
+	ErrInvalidContext = errors.New(ErrMsgInvalidContext)
 
-	ErrRedisNotAvailable = NewRedisError(ErrCodeStoreUnavailable,
-		"Redis store not available", nil).
-		WithSuggestion("Check Redis connection").
-		WithSuggestion("Consider using in-memory store for development")
+	// ErrStorageFailure indicates a storage backend failure
+	ErrStorageFailure = errors.New(ErrMsgStorageFailure)
 
-	ErrNotInitialized = NewAdvancedRateLimitError(ErrCodeNotInitialized,
-		"Rate limiter not properly initialized")
+	// ErrStrategyFailure indicates a rate limiting strategy failure
+	ErrStrategyFailure = errors.New(ErrMsgStrategyFailure)
 
-	ErrFrameworkNotSupported = NewAdvancedRateLimitError(ErrCodeFrameworkNotSupported,
-		"Web framework not supported").
-		WithSuggestion("Use universal middleware: limiter.Middleware()").
-		WithSuggestion("Supported frameworks: Gin, Echo, Fiber, Chi, net/http")
+	// ErrResolverFailure indicates a config resolver failure
+	ErrResolverFailure = errors.New(ErrMsgResolverFailure)
+
+	// ErrLimitExceeded indicates the rate limit has been exceeded
+	ErrLimitExceeded = errors.New(ErrMsgLimitExceeded)
+
+	// ErrInvalidLimit indicates an invalid rate limit value
+	ErrInvalidLimit = errors.New(ErrMsgInvalidLimit)
+
+	// ErrInvalidWindow indicates an invalid time window value
+	ErrInvalidWindow = errors.New(ErrMsgInvalidWindow)
+
+	// ErrInvalidBurst indicates an invalid burst value
+	ErrInvalidBurst = errors.New(ErrMsgInvalidBurst)
+
+	// ErrClosed indicates the rate limiter has been closed
+	ErrClosed = errors.New(ErrMsgClosed)
+
+	// ErrKeyNotFound indicates a key was not found in the store
+	ErrKeyNotFound = errors.New(ErrMsgKeyNotFound)
+
+	// ErrConnectionFailed indicates a connection failure
+	ErrConnectionFailed = errors.New(ErrMsgConnectionFailed)
+
+	// ErrTimeout indicates an operation timeout
+	ErrTimeout = errors.New(ErrMsgTimeout)
+
+	// ErrScriptNotSupported indicates the store doesn't support script execution
+	ErrScriptNotSupported = errors.New(ErrMsgScriptNotSupported)
+
+	// ErrKeyTooLong indicates the key exceeds maximum allowed length
+	ErrKeyTooLong = errors.New(ErrMsgKeyTooLong)
 )
 
-// Error checking utilities
+// ============================================================================
+// ERROR WRAPPING HELPERS - Convenience functions for error wrapping
+// ============================================================================
 
-// IsRateLimitExceeded checks if error is due to rate limit exceeded
+// WrapConfigError wraps a configuration error with additional context
+func WrapConfigError(err error, message string, keyValues ...interface{}) error {
+	if err == nil {
+		return cuserr.NewCustomErrorWithCategory(
+			cuserr.ErrorCategoryValidation,
+			ErrCodeInvalidConfig,
+			message,
+		)
+	}
+
+	cusErr := cuserr.NewCustomError(ErrInvalidConfig, err, message)
+	addMetadata(cusErr, keyValues...)
+	return cusErr
+}
+
+// WrapContextError wraps a context error with additional context
+func WrapContextError(err error, message string, keyValues ...interface{}) error {
+	if err == nil {
+		return cuserr.NewCustomErrorWithCategory(
+			cuserr.ErrorCategoryValidation,
+			ErrCodeInvalidContext,
+			message,
+		)
+	}
+
+	cusErr := cuserr.NewCustomError(ErrInvalidContext, err, message)
+	addMetadata(cusErr, keyValues...)
+	return cusErr
+}
+
+// WrapStorageError wraps a storage error with additional context
+func WrapStorageError(err error, operation string, keyValues ...interface{}) error {
+	message := fmt.Sprintf("storage operation failed: %s", operation)
+	metadata := append([]interface{}{"operation", operation}, keyValues...)
+
+	if err == nil {
+		cusErr := cuserr.NewInternalError("storage", nil)
+		cusErr.Message = message
+		addMetadata(cusErr, metadata...)
+		return cusErr
+	}
+
+	cusErr := cuserr.NewCustomError(ErrStorageFailure, err, message)
+	addMetadata(cusErr, metadata...)
+	return cusErr
+}
+
+// WrapStrategyError wraps a strategy error with additional context
+func WrapStrategyError(err error, strategyName string, keyValues ...interface{}) error {
+	message := fmt.Sprintf("strategy execution failed: %s", strategyName)
+	metadata := append([]interface{}{"strategy", strategyName}, keyValues...)
+
+	if err == nil {
+		cusErr := cuserr.NewInternalError("strategy", nil)
+		cusErr.Message = message
+		addMetadata(cusErr, metadata...)
+		return cusErr
+	}
+
+	cusErr := cuserr.NewCustomError(ErrStrategyFailure, err, message)
+	addMetadata(cusErr, metadata...)
+	return cusErr
+}
+
+// WrapResolverError wraps a resolver error with additional context
+func WrapResolverError(err error, message string, keyValues ...interface{}) error {
+	if err == nil {
+		cusErr := cuserr.NewInternalError("resolver", nil)
+		cusErr.Message = message
+		addMetadata(cusErr, keyValues...)
+		return cusErr
+	}
+
+	cusErr := cuserr.NewCustomError(ErrResolverFailure, err, message)
+	addMetadata(cusErr, keyValues...)
+	return cusErr
+}
+
+// NewLimitExceededError creates a rate limit exceeded error with context
+func NewLimitExceededError(identity, scope string, limit, used int64, keyValues ...interface{}) error {
+	message := fmt.Sprintf("rate limit exceeded for %s in scope %s (%d/%d used)",
+		identity, scope, used, limit)
+
+	metadata := append([]interface{}{
+		"identity", identity,
+		"scope", scope,
+		"limit", limit,
+		"used", used,
+	}, keyValues...)
+
+	cusErr := cuserr.NewCustomErrorWithCategory(
+		cuserr.ErrorCategoryValidation,
+		ErrCodeLimitExceeded,
+		message,
+	)
+	addMetadata(cusErr, metadata...)
+	return cusErr
+}
+
+// NewConnectionError creates a connection error with context
+func NewConnectionError(storeType, address string, err error, keyValues ...interface{}) error {
+	message := fmt.Sprintf("failed to connect to %s at %s", storeType, address)
+	metadata := append([]interface{}{
+		"store_type", storeType,
+		"address", address,
+	}, keyValues...)
+
+	if err == nil {
+		cusErr := cuserr.NewExternalError(storeType, "connect", nil)
+		cusErr.Message = message
+		addMetadata(cusErr, metadata...)
+		return cusErr
+	}
+
+	cusErr := cuserr.NewExternalError(storeType, "connect", err)
+	cusErr.Message = message
+	addMetadata(cusErr, metadata...)
+	return cusErr
+}
+
+// NewTimeoutError creates a timeout error with context
+func NewTimeoutError(operation string, duration interface{}, keyValues ...interface{}) error {
+	message := fmt.Sprintf("operation timed out: %s", operation)
+	metadata := append([]interface{}{
+		"operation", operation,
+		"timeout", duration,
+	}, keyValues...)
+
+	cusErr := cuserr.NewCustomErrorWithCategory(
+		cuserr.ErrorCategoryValidation,
+		ErrCodeTimeout,
+		message,
+	)
+	addMetadata(cusErr, metadata...)
+	return cusErr
+}
+
+// addMetadata is a helper to add key-value metadata to CustomError
+func addMetadata(err *cuserr.CustomError, keyValues ...interface{}) {
+	if err == nil || len(keyValues) == 0 {
+		return
+	}
+
+	for i := 0; i < len(keyValues)-1; i += 2 {
+		key, ok := keyValues[i].(string)
+		if !ok {
+			continue
+		}
+		value := keyValues[i+1]
+		// WithMetadata expects string values, so convert to string
+		valueStr := fmt.Sprintf("%v", value)
+		err.WithMetadata(key, valueStr)
+	}
+}
+
+// ============================================================================
+// ERROR VALIDATION HELPERS
+// ============================================================================
+
+// ValidateLimitValue validates a rate limit value
+func ValidateLimitValue(limit int64) error {
+	if limit < MinLimit {
+		return cuserr.NewCustomErrorWithCategory(
+			cuserr.ErrorCategoryValidation,
+			ErrCodeInvalidLimit,
+			fmt.Sprintf("limit %d is below minimum %d", limit, MinLimit),
+		)
+	}
+	if limit > MaxLimit {
+		return cuserr.NewCustomErrorWithCategory(
+			cuserr.ErrorCategoryValidation,
+			ErrCodeInvalidLimit,
+			fmt.Sprintf("limit %d exceeds maximum %d", limit, MaxLimit),
+		)
+	}
+	return nil
+}
+
+// ValidateWindowSeconds validates a window duration in seconds
+func ValidateWindowSeconds(windowSec int64) error {
+	if windowSec < MinWindowSeconds {
+		return cuserr.NewCustomErrorWithCategory(
+			cuserr.ErrorCategoryValidation,
+			ErrCodeInvalidWindow,
+			fmt.Sprintf("window %ds is below minimum %ds", windowSec, MinWindowSeconds),
+		)
+	}
+	if windowSec > MaxWindowSeconds {
+		return cuserr.NewCustomErrorWithCategory(
+			cuserr.ErrorCategoryValidation,
+			ErrCodeInvalidWindow,
+			fmt.Sprintf("window %ds exceeds maximum %ds", windowSec, MaxWindowSeconds),
+		)
+	}
+	return nil
+}
+
+// ValidateBurstValue validates a burst value
+func ValidateBurstValue(burst int64) error {
+	if burst < MinBurst {
+		return cuserr.NewCustomErrorWithCategory(
+			cuserr.ErrorCategoryValidation,
+			ErrCodeInvalidBurst,
+			fmt.Sprintf("burst %d is below minimum %d", burst, MinBurst),
+		)
+	}
+	if burst > MaxBurst {
+		return cuserr.NewCustomErrorWithCategory(
+			cuserr.ErrorCategoryValidation,
+			ErrCodeInvalidBurst,
+			fmt.Sprintf("burst %d exceeds maximum %d", burst, MaxBurst),
+		)
+	}
+	return nil
+}
+
+// ValidateKeyLength validates a storage key length
+// Returns ErrKeyTooLong if the key exceeds MaxKeyLength bytes
+func ValidateKeyLength(key string) error {
+	if len(key) > MaxKeyLength {
+		return cuserr.NewCustomErrorWithCategory(
+			cuserr.ErrorCategoryValidation,
+			ErrCodeKeyTooLong,
+			fmt.Sprintf("key length %d exceeds maximum %d bytes", len(key), MaxKeyLength),
+		)
+	}
+	return nil
+}
+
+// ============================================================================
+// ERROR CHECKING HELPERS
+// ============================================================================
+
+// IsRateLimitExceeded checks if error is a rate limit exceeded error
 func IsRateLimitExceeded(err error) bool {
-	var rateLimitErr *AdvancedRateLimitError
-	return errors.As(err, &rateLimitErr) && rateLimitErr.Code == ErrCodeRateLimitExceeded
+	return errors.Is(err, ErrLimitExceeded) ||
+		(cuserr.IsCompatibleError(err) && cuserr.GetErrorCode(err) == ErrCodeLimitExceeded)
+}
+
+// IsStorageFailure checks if error is a storage failure
+func IsStorageFailure(err error) bool {
+	return errors.Is(err, ErrStorageFailure) ||
+		(cuserr.IsCompatibleError(err) && cuserr.GetErrorCode(err) == ErrCodeStorageFailure)
 }
 
 // IsConfigError checks if error is a configuration error
 func IsConfigError(err error) bool {
-	var rateLimitErr *AdvancedRateLimitError
-	if errors.As(err, &rateLimitErr) {
-		return rateLimitErr.Code == ErrCodeInvalidConfig ||
-			rateLimitErr.Code == ErrCodeInvalidLimit ||
-			rateLimitErr.Code == ErrCodeInvalidAlgorithm ||
-			rateLimitErr.Code == ErrCodeMissingConfig
-	}
-	return false
+	return errors.Is(err, ErrInvalidConfig) ||
+		(cuserr.IsCompatibleError(err) && cuserr.GetErrorCode(err) == ErrCodeInvalidConfig)
 }
 
-// IsConnectionError checks if error is a connection-related error
+// IsContextError checks if error is a context error
+func IsContextError(err error) bool {
+	return errors.Is(err, ErrInvalidContext) ||
+		(cuserr.IsCompatibleError(err) && cuserr.GetErrorCode(err) == ErrCodeInvalidContext)
+}
+
+// IsConnectionError checks if error is a connection error
 func IsConnectionError(err error) bool {
-	var rateLimitErr *AdvancedRateLimitError
-	if errors.As(err, &rateLimitErr) {
-		return rateLimitErr.Code == ErrCodeRedisConnection ||
-			rateLimitErr.Code == ErrCodeRedisTimeout ||
-			rateLimitErr.Code == ErrCodeRedisAuth ||
-			rateLimitErr.Code == ErrCodeStoreUnavailable
-	}
-	return false
+	return errors.Is(err, ErrConnectionFailed) ||
+		(cuserr.IsCompatibleError(err) && cuserr.GetErrorCode(err) == ErrCodeConnectionFailed)
 }
 
-// IsRetryable checks if an error condition is retryable
-func IsRetryable(err error) bool {
-	var rateLimitErr *AdvancedRateLimitError
-	if errors.As(err, &rateLimitErr) {
-		return rateLimitErr.IsRetryable()
-	}
-	return false
+// IsTimeoutError checks if error is a timeout error
+func IsTimeoutError(err error) bool {
+	return errors.Is(err, ErrTimeout) ||
+		(cuserr.IsCompatibleError(err) && cuserr.GetErrorCode(err) == ErrCodeTimeout)
 }
 
-// GetRetryAfter extracts retry-after duration from rate limit errors
-func GetRetryAfter(err error) (time.Duration, bool) {
-	var rateLimitErr *AdvancedRateLimitError
-	if errors.As(err, &rateLimitErr) && rateLimitErr.RetryAfter > 0 {
-		return rateLimitErr.RetryAfter, true
-	}
-	return 0, false
+// IsClosed checks if error indicates limiter is closed
+func IsClosed(err error) bool {
+	return errors.Is(err, ErrClosed) ||
+		(cuserr.IsCompatibleError(err) && cuserr.GetErrorCode(err) == ErrCodeClosed)
 }
 
-// ErrorHandler defines how errors should be handled
-type ErrorHandler func(error)
-
-// DefaultErrorHandler provides basic console error handling
-func DefaultErrorHandler(err error) {
-	var rateLimitErr *AdvancedRateLimitError
-	if errors.As(err, &rateLimitErr) {
-		fmt.Printf("[ERROR %s] %s\n", rateLimitErr.Code, rateLimitErr.Message)
-		if rateLimitErr.Details != "" {
-			fmt.Printf("  Details: %s\n", rateLimitErr.Details)
-		}
-		if len(rateLimitErr.Suggestions) > 0 {
-			fmt.Println("  Suggestions:")
-			for _, suggestion := range rateLimitErr.Suggestions {
-				fmt.Printf("    - %s\n", suggestion)
-			}
-		}
-	} else {
-		fmt.Printf("[ERROR] %v\n", err)
-	}
+// IsScriptNotSupported checks if error indicates scripts are not supported
+func IsScriptNotSupported(err error) bool {
+	return errors.Is(err, ErrScriptNotSupported) ||
+		(cuserr.IsCompatibleError(err) && cuserr.GetErrorCode(err) == ErrCodeScriptNotSupported)
 }
 
-// ErrorRecovery provides error recovery strategies
-type ErrorRecovery struct {
-	maxRetries     int
-	retryDelay     time.Duration
-	circuitBreaker bool
-}
-
-// NewErrorRecovery creates a new error recovery handler
-func NewErrorRecovery(maxRetries int, retryDelay time.Duration) *ErrorRecovery {
-	return &ErrorRecovery{
-		maxRetries:     maxRetries,
-		retryDelay:     retryDelay,
-		circuitBreaker: true,
-	}
-}
-
-// RetryWithBackoff retries an operation with exponential backoff
-func (er *ErrorRecovery) RetryWithBackoff(operation func() error) error {
-	var lastErr error
-
-	for attempt := 0; attempt < er.maxRetries; attempt++ {
-		err := operation()
-		if err == nil {
-			return nil
-		}
-
-		lastErr = err
-
-		// Check if error is retryable
-		if !IsRetryable(err) {
-			return err
-		}
-
-		// Check for circuit breaker condition
-		var rateLimitErr *AdvancedRateLimitError
-		if er.circuitBreaker && errors.As(err, &rateLimitErr) && rateLimitErr.ShouldCircuitBreak() {
-			return fmt.Errorf("circuit breaker opened due to: %w", err)
-		}
-
-		// Wait before retry with exponential backoff
-		delay := er.retryDelay * time.Duration(1<<uint(attempt))
-		if retryAfter, hasRetryAfter := GetRetryAfter(err); hasRetryAfter {
-			// Use the retry-after from rate limit error if available
-			delay = retryAfter
-		}
-
-		time.Sleep(delay)
-	}
-
-	return fmt.Errorf("operation failed after %d attempts: %w", er.maxRetries, lastErr)
-}
-
-// Helper functions
-
-func max(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
+// IsKeyTooLong checks if error indicates key length exceeded maximum
+func IsKeyTooLong(err error) bool {
+	return errors.Is(err, ErrKeyTooLong) ||
+		(cuserr.IsCompatibleError(err) && cuserr.GetErrorCode(err) == ErrCodeKeyTooLong)
 }

@@ -50,6 +50,11 @@ func (m *mockStore) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+func (m *mockStore) ExecuteScript(ctx context.Context, script string, keys []string, args ...interface{}) (interface{}, error) {
+	// Mock store doesn't support scripts - return error
+	return nil, NewRateLimitError("storage", "script execution not supported by mock store", nil)
+}
+
 func TestNewTokenBucketAlgorithm(t *testing.T) {
 	algorithm := NewTokenBucketAlgorithm()
 
@@ -639,4 +644,328 @@ func BenchmarkTokenBucketAlgorithm_ConcurrentAllow(b *testing.B) {
 			i++
 		}
 	})
+}
+
+// ============================================================================
+// P0-3 STATISTICS INTEGRITY TESTS
+// Tests for clamping statistics to prevent impossible values
+// ============================================================================
+
+// TestClampStatistics_ValidRange tests the clampStatistics helper function
+// with various input scenarios to ensure it always returns valid statistics
+func TestClampStatistics_ValidRange(t *testing.T) {
+	tests := []struct {
+		name              string
+		remaining         int64
+		limit             int64
+		expectedRemaining int64
+		expectedUsed      int64
+		description       string
+	}{
+		{
+			name:              "normal case - remaining within limit",
+			remaining:         50,
+			limit:             100,
+			expectedRemaining: 50,
+			expectedUsed:      50,
+			description:       "Normal case should pass through unchanged",
+		},
+		{
+			name:              "edge case - remaining equals limit",
+			remaining:         100,
+			limit:             100,
+			expectedRemaining: 100,
+			expectedUsed:      0,
+			description:       "When remaining equals limit, used should be 0",
+		},
+		{
+			name:              "edge case - remaining is zero",
+			remaining:         0,
+			limit:             100,
+			expectedRemaining: 0,
+			expectedUsed:      100,
+			description:       "When remaining is 0, used should equal limit",
+		},
+		{
+			name:              "impossible case - remaining exceeds limit",
+			remaining:         150,
+			limit:             100,
+			expectedRemaining: 100,
+			expectedUsed:      0,
+			description:       "P0-3: Remaining > Limit should clamp to Limit",
+		},
+		{
+			name:              "impossible case - remaining is negative",
+			remaining:         -10,
+			limit:             100,
+			expectedRemaining: 0,
+			expectedUsed:      100,
+			description:       "P0-3: Negative remaining should clamp to 0",
+		},
+		{
+			name:              "impossible case - large negative remaining",
+			remaining:         -1000,
+			limit:             100,
+			expectedRemaining: 0,
+			expectedUsed:      100,
+			description:       "P0-3: Large negative values should clamp to 0",
+		},
+		{
+			name:              "impossible case - remaining far exceeds limit",
+			remaining:         999999,
+			limit:             100,
+			expectedRemaining: 100,
+			expectedUsed:      0,
+			description:       "P0-3: Extremely high remaining should clamp to limit",
+		},
+		{
+			name:              "small limit - remaining within bounds",
+			remaining:         1,
+			limit:             10,
+			expectedRemaining: 1,
+			expectedUsed:      9,
+			description:       "Small limits should work correctly",
+		},
+		{
+			name:              "large limit - remaining within bounds",
+			remaining:         500000,
+			limit:             1000000,
+			expectedRemaining: 500000,
+			expectedUsed:      500000,
+			description:       "Large limits should work correctly",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotRemaining, gotUsed := clampStatistics(tt.remaining, tt.limit)
+
+			if gotRemaining != tt.expectedRemaining {
+				t.Errorf("clampStatistics() gotRemaining = %d, expected %d - %s",
+					gotRemaining, tt.expectedRemaining, tt.description)
+			}
+
+			if gotUsed != tt.expectedUsed {
+				t.Errorf("clampStatistics() gotUsed = %d, expected %d - %s",
+					gotUsed, tt.expectedUsed, tt.description)
+			}
+
+			// P0-3 CRITICAL INVARIANTS that must ALWAYS hold:
+			if gotRemaining < 0 {
+				t.Errorf("P0-3 FAILURE: Remaining is negative (%d) - this is impossible!", gotRemaining)
+			}
+
+			if gotRemaining > tt.limit {
+				t.Errorf("P0-3 FAILURE: Remaining (%d) exceeds Limit (%d) - this is impossible!",
+					gotRemaining, tt.limit)
+			}
+
+			if gotUsed < 0 {
+				t.Errorf("P0-3 FAILURE: Used is negative (%d) - this is impossible!", gotUsed)
+			}
+
+			if gotUsed > tt.limit {
+				t.Errorf("P0-3 FAILURE: Used (%d) exceeds Limit (%d) - this is impossible!",
+					gotUsed, tt.limit)
+			}
+
+			if gotRemaining+gotUsed != tt.limit {
+				t.Errorf("P0-3 FAILURE: Remaining(%d) + Used(%d) != Limit(%d) - inconsistent stats!",
+					gotRemaining, gotUsed, tt.limit)
+			}
+		})
+	}
+}
+
+// TestTokenBucket_Stats_NeverExceedsLimit is the main P0-3 verification test
+// It ensures that Result statistics always satisfy the invariants:
+// - 0 <= Remaining <= Limit
+// - 0 <= Used <= Limit
+// - Remaining + Used = Limit
+func TestTokenBucket_Stats_NeverExceedsLimit(t *testing.T) {
+	algorithm := NewTokenBucketAlgorithm()
+	store := newMockStore()
+	ctx := context.Background()
+
+	tests := []struct {
+		name          string
+		limit         int64
+		window        time.Duration
+		requests      []int64 // Sequence of request sizes
+		description   string
+		expectedStats func(result *Result, limit int64) error
+	}{
+		{
+			name:        "single request within limit",
+			limit:       100,
+			window:      time.Minute,
+			requests:    []int64{50},
+			description: "After consuming 50 tokens, Remaining should be 50, Used should be 50",
+			expectedStats: func(result *Result, limit int64) error {
+				if result.Remaining != 50 {
+					return fmt.Errorf("expected Remaining=50, got %d", result.Remaining)
+				}
+				if result.Used != 50 {
+					return fmt.Errorf("expected Used=50, got %d", result.Used)
+				}
+				return nil
+			},
+		},
+		{
+			name:        "exhaust all tokens",
+			limit:       100,
+			window:      time.Minute,
+			requests:    []int64{100},
+			description: "After consuming all tokens, Remaining should be 0, Used should be 100",
+			expectedStats: func(result *Result, limit int64) error {
+				if result.Remaining != 0 {
+					return fmt.Errorf("expected Remaining=0, got %d", result.Remaining)
+				}
+				if result.Used != 100 {
+					return fmt.Errorf("expected Used=100, got %d", result.Used)
+				}
+				return nil
+			},
+		},
+		{
+			name:        "multiple sequential requests",
+			limit:       100,
+			window:      time.Minute,
+			requests:    []int64{30, 30, 30},
+			description: "After 3 requests of 30 each, Remaining should be 10, Used should be 90",
+			expectedStats: func(result *Result, limit int64) error {
+				if result.Remaining != 10 {
+					return fmt.Errorf("expected Remaining=10, got %d", result.Remaining)
+				}
+				if result.Used != 90 {
+					return fmt.Errorf("expected Used=90, got %d", result.Used)
+				}
+				return nil
+			},
+		},
+		{
+			name:        "request exceeding remaining tokens",
+			limit:       100,
+			window:      time.Minute,
+			requests:    []int64{90, 20}, // Second request should be denied
+			description: "After allowed 90, next 20 should be denied with Remaining=10, Used=90",
+			expectedStats: func(result *Result, limit int64) error {
+				// This checks the LAST result (the denied request)
+				if result.Allowed {
+					return fmt.Errorf("request should have been denied")
+				}
+				// When denied, stats should show current state (10 remaining)
+				if result.Remaining < 0 || result.Remaining > limit {
+					return fmt.Errorf("P0-3: Invalid Remaining=%d (must be 0-%d)", result.Remaining, limit)
+				}
+				return nil
+			},
+		},
+		{
+			name:        "small limit edge case",
+			limit:       1,
+			window:      time.Minute,
+			requests:    []int64{1},
+			description: "Limit of 1 should work correctly",
+			expectedStats: func(result *Result, limit int64) error {
+				if result.Remaining != 0 {
+					return fmt.Errorf("expected Remaining=0, got %d", result.Remaining)
+				}
+				if result.Used != 1 {
+					return fmt.Errorf("expected Used=1, got %d", result.Used)
+				}
+				return nil
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Reset bucket for each test
+			key := fmt.Sprintf("test:stats:%s", tt.name)
+			algorithm.Reset(ctx, store, key)
+
+			var lastResult *Result
+			for i, n := range tt.requests {
+				result, err := algorithm.Allow(ctx, store, key, tt.limit, tt.window, n)
+				if err != nil {
+					t.Fatalf("Request %d failed: %v", i, err)
+				}
+				lastResult = result
+
+				// P0-3 CRITICAL INVARIANTS - Check after EVERY request
+				if result.Remaining < 0 {
+					t.Errorf("P0-3 FAILURE (request %d): Remaining is negative (%d)", i, result.Remaining)
+				}
+
+				if result.Remaining > tt.limit {
+					t.Errorf("P0-3 FAILURE (request %d): Remaining (%d) exceeds Limit (%d)",
+						i, result.Remaining, tt.limit)
+				}
+
+				if result.Used < 0 {
+					t.Errorf("P0-3 FAILURE (request %d): Used is negative (%d)", i, result.Used)
+				}
+
+				if result.Used > tt.limit {
+					t.Errorf("P0-3 FAILURE (request %d): Used (%d) exceeds Limit (%d)",
+						i, result.Used, tt.limit)
+				}
+
+				if result.Remaining+result.Used != tt.limit {
+					t.Errorf("P0-3 FAILURE (request %d): Remaining(%d) + Used(%d) != Limit(%d)",
+						i, result.Remaining, result.Used, tt.limit)
+				}
+
+				// Verify Limit field is set correctly
+				if result.Limit != tt.limit {
+					t.Errorf("Request %d: Result.Limit incorrect: got %d, expected %d",
+						i, result.Limit, tt.limit)
+				}
+			}
+
+			// Verify final state matches expected stats
+			if tt.expectedStats != nil {
+				if err := tt.expectedStats(lastResult, tt.limit); err != nil {
+					t.Errorf("Final state validation failed: %v - %s", err, tt.description)
+				}
+			}
+		})
+	}
+}
+
+// TestTokenBucket_Stats_IntegrityUnderLoad verifies statistics remain valid
+// even under rapid sequential requests (simulating high load)
+func TestTokenBucket_Stats_IntegrityUnderLoad(t *testing.T) {
+	algorithm := NewTokenBucketAlgorithm()
+	store := newMockStore()
+	ctx := context.Background()
+
+	key := "test:stats:load"
+	limit := int64(1000)
+	window := time.Minute
+
+	// Make many small requests rapidly
+	for i := 0; i < 100; i++ {
+		result, err := algorithm.Allow(ctx, store, key, limit, window, 10)
+		if err != nil {
+			t.Fatalf("Request %d failed: %v", i, err)
+		}
+
+		// P0-3: Verify invariants on every result
+		if result.Remaining < 0 || result.Remaining > limit {
+			t.Errorf("P0-3 FAILURE (request %d): Invalid Remaining=%d (must be 0-%d)",
+				i, result.Remaining, limit)
+		}
+
+		if result.Used < 0 || result.Used > limit {
+			t.Errorf("P0-3 FAILURE (request %d): Invalid Used=%d (must be 0-%d)",
+				i, result.Used, limit)
+		}
+
+		if result.Remaining+result.Used != limit {
+			t.Errorf("P0-3 FAILURE (request %d): Remaining(%d) + Used(%d) = %d, expected %d",
+				i, result.Remaining, result.Used, result.Remaining+result.Used, limit)
+		}
+	}
 }

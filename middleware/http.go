@@ -4,18 +4,22 @@ package middleware
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/itsatony/gorly"
+	"github.com/itsatony/gorly/stores"
 )
 
 // HTTPMiddleware provides rate limiting middleware for standard net/http
 type HTTPMiddleware struct {
 	config    *HTTPMiddlewareConfig
 	limiter   ratelimit.RateLimiter
-	extractor HTTPEntityExtractor
+	extractor HTTPContextExtractor
+	formatter ErrorFormatter
 }
 
 // HTTPMiddlewareConfig configures the HTTP middleware
@@ -23,14 +27,15 @@ type HTTPMiddlewareConfig struct {
 	// Limiter is the rate limiter to use
 	Limiter ratelimit.RateLimiter
 
-	// EntityExtractor extracts the auth entity from the request
-	EntityExtractor HTTPEntityExtractor
-
-	// ScopeExtractor extracts the scope from the request (optional)
-	ScopeExtractor HTTPScopeExtractor
+	// ContextExtractor extracts the rate limit context from the request
+	ContextExtractor HTTPContextExtractor
 
 	// ErrorHandler handles rate limit errors (optional)
 	ErrorHandler HTTPErrorHandler
+
+	// ErrorFormatter formats errors securely for client responses (optional)
+	// Defaults to DefaultErrorFormatter with ExposeDetails=false for security
+	ErrorFormatter ErrorFormatter
 
 	// SkipSuccessfulRequests only counts failed requests toward rate limit
 	SkipSuccessfulRequests bool
@@ -45,11 +50,8 @@ type HTTPMiddlewareConfig struct {
 	CustomResponse *HTTPRateLimitResponse
 }
 
-// HTTPEntityExtractor extracts an AuthEntity from an HTTP request
-type HTTPEntityExtractor func(r *http.Request) (ratelimit.AuthEntity, error)
-
-// HTTPScopeExtractor extracts the scope from an HTTP request
-type HTTPScopeExtractor func(r *http.Request) string
+// HTTPContextExtractor extracts a Identity from an HTTP request
+type HTTPContextExtractor func(r *http.Request) (ratelimit.Identity, error)
 
 // HTTPErrorHandler handles rate limit errors
 type HTTPErrorHandler func(w http.ResponseWriter, r *http.Request, err error, result *ratelimit.Result)
@@ -59,6 +61,75 @@ type HTTPRateLimitResponse struct {
 	StatusCode int               `json:"status_code"`
 	Headers    map[string]string `json:"headers"`
 	Body       interface{}       `json:"body"`
+}
+
+// ============================================================================
+// ERROR FORMATTING - Secure error message handling
+// ============================================================================
+
+// ErrorFormatter formats errors for HTTP responses in a secure way
+// It should never expose internal implementation details, stack traces,
+// or sensitive information like connection strings or file paths
+type ErrorFormatter interface {
+	// FormatError converts an internal error into a safe client-facing message
+	// The original error is provided for logging/debugging but should NOT be
+	// included in the returned message
+	FormatError(err error, errorType ErrorType) string
+}
+
+// ErrorType categorizes errors for appropriate error messages
+type ErrorType string
+
+const (
+	// ErrorTypeExtraction indicates failure to extract rate limit context
+	ErrorTypeExtraction ErrorType = "extraction"
+
+	// ErrorTypeRateLimit indicates a rate limiting operation error
+	ErrorTypeRateLimit ErrorType = "rate_limit"
+
+	// ErrorTypeConfiguration indicates a configuration error
+	ErrorTypeConfiguration ErrorType = "configuration"
+
+	// ErrorTypeInternal indicates an unexpected internal error
+	ErrorTypeInternal ErrorType = "internal"
+)
+
+// DefaultErrorFormatter provides safe, generic error messages
+type DefaultErrorFormatter struct {
+	// ExposeDetails controls whether to include error details (ONLY for development!)
+	// SECURITY WARNING: Never enable this in production!
+	ExposeDetails bool
+
+	// Logger for internal error logging (optional)
+	Logger *log.Logger
+}
+
+// FormatError converts errors to safe client messages
+func (f *DefaultErrorFormatter) FormatError(err error, errorType ErrorType) string {
+	// Always log the real error internally for debugging
+	if f.Logger != nil {
+		f.Logger.Printf("[%s] Internal error: %v", errorType, err)
+	}
+
+	// SECURITY: Never expose internal errors in production
+	if f.ExposeDetails {
+		// ONLY for development/debugging - includes actual error
+		return fmt.Sprintf("Rate limiting error: %s", err.Error())
+	}
+
+	// Production-safe generic messages
+	switch errorType {
+	case ErrorTypeExtraction:
+		return "Unable to process request"
+	case ErrorTypeRateLimit:
+		return "Rate limiting service unavailable"
+	case ErrorTypeConfiguration:
+		return "Service temporarily unavailable"
+	case ErrorTypeInternal:
+		return "Internal error occurred"
+	default:
+		return "An error occurred"
+	}
 }
 
 // NewHTTPMiddleware creates a new HTTP middleware
@@ -71,19 +142,28 @@ func NewHTTPMiddleware(config *HTTPMiddlewareConfig) (*HTTPMiddleware, error) {
 		return nil, fmt.Errorf("rate limiter is required")
 	}
 
-	if config.EntityExtractor == nil {
+	if config.ContextExtractor == nil {
 		// Default to IP-based extraction
-		config.EntityExtractor = DefaultIPEntityExtractor
+		config.ContextExtractor = DefaultIPContextExtractor
+	}
+
+	if config.ErrorFormatter == nil {
+		// Default to secure error formatter (no details exposed)
+		config.ErrorFormatter = &DefaultErrorFormatter{
+			ExposeDetails: false, // SECURITY: Never expose details in production
+		}
 	}
 
 	if config.ErrorHandler == nil {
-		config.ErrorHandler = DefaultHTTPErrorHandler
+		// Use new secure error handler with formatter
+		config.ErrorHandler = NewSecureHTTPErrorHandler(config.ErrorFormatter)
 	}
 
 	return &HTTPMiddleware{
 		config:    config,
 		limiter:   config.Limiter,
-		extractor: config.EntityExtractor,
+		extractor: config.ContextExtractor,
+		formatter: config.ErrorFormatter,
 	}, nil
 }
 
@@ -96,21 +176,15 @@ func (m *HTTPMiddleware) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Extract entity
-		entity, err := m.extractor(r)
+		// Extract rate limit context
+		rlCtx, err := m.extractor(r)
 		if err != nil {
 			m.config.ErrorHandler(w, r, err, nil)
 			return
 		}
 
-		// Extract scope
-		scope := ratelimit.ScopeGlobal
-		if m.config.ScopeExtractor != nil {
-			scope = m.config.ScopeExtractor(r)
-		}
-
 		// Check rate limit
-		result, err := m.limiter.Allow(r.Context(), entity, scope)
+		result, err := m.limiter.Allow(r.Context(), rlCtx)
 		if err != nil {
 			m.config.ErrorHandler(w, r, err, result)
 			return
@@ -151,7 +225,7 @@ func (m *HTTPMiddleware) shouldSkipPath(path string) bool {
 func (m *HTTPMiddleware) addRateLimitHeaders(w http.ResponseWriter, result *ratelimit.Result) {
 	w.Header().Set("X-RateLimit-Limit", strconv.FormatInt(result.Limit, 10))
 	w.Header().Set("X-RateLimit-Remaining", strconv.FormatInt(result.Remaining, 10))
-	w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(result.ResetTime.Unix(), 10))
+	w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(result.ResetAt.Unix(), 10))
 
 	if !result.Allowed && result.RetryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.FormatInt(int64(result.RetryAfter.Seconds()), 10))
@@ -160,8 +234,13 @@ func (m *HTTPMiddleware) addRateLimitHeaders(w http.ResponseWriter, result *rate
 
 // handleRateLimit handles rate limit exceeded responses
 func (m *HTTPMiddleware) handleRateLimit(w http.ResponseWriter, r *http.Request, result *ratelimit.Result) {
+	// P0-2 FIX: Always add standard rate limit headers FIRST
+	// This ensures headers are present even with custom responses (fixes API contract violation)
+	// Standard headers: X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After
+	m.addRateLimitHeaders(w, result)
+
 	if m.config.CustomResponse != nil {
-		// Use custom response
+		// Use custom response - headers were already added above
 		for key, value := range m.config.CustomResponse.Headers {
 			w.Header().Set(key, value)
 		}
@@ -178,8 +257,7 @@ func (m *HTTPMiddleware) handleRateLimit(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	// Default rate limit response
-	m.addRateLimitHeaders(w, result)
+	// Default rate limit response - headers already added above
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusTooManyRequests)
 
@@ -193,26 +271,24 @@ func (m *HTTPMiddleware) handleRateLimit(w http.ResponseWriter, r *http.Request,
 	json.NewEncoder(w).Encode(response)
 }
 
-// DefaultIPEntityExtractor extracts entity information based on IP address
-func DefaultIPEntityExtractor(r *http.Request) (ratelimit.AuthEntity, error) {
+// DefaultIPContextExtractor extracts context based on IP address
+func DefaultIPContextExtractor(r *http.Request) (ratelimit.Identity, error) {
 	ip := getClientIP(r)
 	if ip == "" {
-		return nil, fmt.Errorf("unable to determine client IP")
+		// SECURITY: Don't expose that we're looking for IP address
+		return nil, fmt.Errorf("unable to process request")
 	}
 
-	return ratelimit.NewDefaultAuthEntity(
-		ip,
-		ratelimit.EntityTypeIP,
-		ratelimit.TierFree, // Default tier for IP-based limiting
-	), nil
+	return ratelimit.NewIPContext(ip), nil
 }
 
-// APIKeyEntityExtractor creates an entity extractor that uses API keys from headers
-func APIKeyEntityExtractor(headerName string, getUserTier func(apiKey string) string) HTTPEntityExtractor {
-	return func(r *http.Request) (ratelimit.AuthEntity, error) {
+// APIKeyContextExtractor creates a context extractor that uses API keys from headers
+func APIKeyContextExtractor(headerName string, getUserTier func(apiKey string) string) HTTPContextExtractor {
+	return func(r *http.Request) (ratelimit.Identity, error) {
 		apiKey := r.Header.Get(headerName)
 		if apiKey == "" {
-			return nil, fmt.Errorf("API key not found in header %s", headerName)
+			// SECURITY: Don't expose which header we're looking for
+			return nil, fmt.Errorf("authentication required")
 		}
 
 		tier := ratelimit.TierFree
@@ -220,20 +296,17 @@ func APIKeyEntityExtractor(headerName string, getUserTier func(apiKey string) st
 			tier = getUserTier(apiKey)
 		}
 
-		return ratelimit.NewDefaultAuthEntity(
-			apiKey,
-			ratelimit.EntityTypeAPIKey,
-			tier,
-		), nil
+		return ratelimit.NewAPIKeyContext(apiKey, tier), nil
 	}
 }
 
-// UserEntityExtractor creates an entity extractor that uses user information from context
-func UserEntityExtractor(contextKey string) HTTPEntityExtractor {
-	return func(r *http.Request) (ratelimit.AuthEntity, error) {
+// UserContextExtractor creates a context extractor that uses user information from context
+func UserContextExtractor(contextKey string) HTTPContextExtractor {
+	return func(r *http.Request) (ratelimit.Identity, error) {
 		userInfo := r.Context().Value(contextKey)
 		if userInfo == nil {
-			return nil, fmt.Errorf("user information not found in context")
+			// SECURITY: Don't expose that we're looking for user info in context
+			return nil, fmt.Errorf("authentication required")
 		}
 
 		// Expect userInfo to have ID and Tier methods or be a map
@@ -241,11 +314,7 @@ func UserEntityExtractor(contextKey string) HTTPEntityExtractor {
 			ID() string
 			Tier() string
 		}); ok {
-			return ratelimit.NewDefaultAuthEntity(
-				user.ID(),
-				ratelimit.EntityTypeUser,
-				user.Tier(),
-			), nil
+			return ratelimit.NewUserContext(user.ID(), user.Tier()), nil
 		}
 
 		if userMap, ok := userInfo.(map[string]interface{}); ok {
@@ -256,80 +325,112 @@ func UserEntityExtractor(contextKey string) HTTPEntityExtractor {
 			}
 
 			if id == "" {
-				return nil, fmt.Errorf("user ID not found in context")
+				// SECURITY: Generic error message
+				return nil, fmt.Errorf("authentication required")
 			}
 
-			return ratelimit.NewDefaultAuthEntity(
-				id,
-				ratelimit.EntityTypeUser,
-				tier,
-			), nil
+			return ratelimit.NewUserContext(id, tier), nil
 		}
 
-		return nil, fmt.Errorf("invalid user information format in context")
+		// SECURITY: Don't expose "invalid format" - that's internal implementation
+		return nil, fmt.Errorf("authentication required")
 	}
 }
 
-// PathScopeExtractor creates a scope extractor based on URL path patterns
-func PathScopeExtractor(pathMappings map[string]string) HTTPScopeExtractor {
-	return func(r *http.Request) string {
+// PathScopeContextExtractor creates a context extractor with dynamic scope based on URL path
+func PathScopeContextExtractor(pathMappings map[string]string, baseExtractor HTTPContextExtractor) HTTPContextExtractor {
+	return func(r *http.Request) (ratelimit.Identity, error) {
+		// Get base context
+		baseCtx, err := baseExtractor(r)
+		if err != nil {
+			return nil, err
+		}
+
+		// Determine scope from path
 		path := r.URL.Path
+		scope := ratelimit.ScopeGlobal
 
 		// Check for exact matches first
-		if scope, exists := pathMappings[path]; exists {
-			return scope
-		}
-
-		// Check for prefix matches
-		for pattern, scope := range pathMappings {
-			if strings.HasPrefix(path, pattern) {
-				return scope
+		if s, exists := pathMappings[path]; exists {
+			scope = s
+		} else {
+			// Check for prefix matches
+			for pattern, s := range pathMappings {
+				if strings.HasPrefix(path, pattern) {
+					scope = s
+					break
+				}
 			}
 		}
 
-		return ratelimit.ScopeGlobal
+		// Create new context with the determined scope
+		return ratelimit.NewSimpleContext(
+			baseCtx.Identity(),
+			scope,
+			baseCtx.Tier(),
+			baseCtx.Metadata(),
+		), nil
 	}
 }
 
-// MethodScopeExtractor creates a scope extractor based on HTTP method
-func MethodScopeExtractor() HTTPScopeExtractor {
-	return func(r *http.Request) string {
+// MethodScopeContextExtractor creates a context extractor with scope based on HTTP method
+func MethodScopeContextExtractor(baseExtractor HTTPContextExtractor) HTTPContextExtractor {
+	return func(r *http.Request) (ratelimit.Identity, error) {
+		// Get base context
+		baseCtx, err := baseExtractor(r)
+		if err != nil {
+			return nil, err
+		}
+
+		// Determine scope from method
+		var scope string
 		switch r.Method {
 		case http.MethodPost, http.MethodPut, http.MethodPatch:
-			return "write"
+			scope = "write"
 		case http.MethodDelete:
-			return "delete"
+			scope = "delete"
 		case http.MethodGet, http.MethodHead, http.MethodOptions:
-			return "read"
+			scope = "read"
 		default:
-			return ratelimit.ScopeGlobal
+			scope = ratelimit.ScopeGlobal
 		}
+
+		// Create new context with the determined scope
+		return ratelimit.NewSimpleContext(
+			baseCtx.Identity(),
+			scope,
+			baseCtx.Tier(),
+			baseCtx.Metadata(),
+		), nil
 	}
 }
 
-// CombinedScopeExtractor combines multiple scope extractors
-func CombinedScopeExtractor(extractors ...HTTPScopeExtractor) HTTPScopeExtractor {
-	return func(r *http.Request) string {
-		for _, extractor := range extractors {
-			if scope := extractor(r); scope != ratelimit.ScopeGlobal {
-				return scope
-			}
+// NewSecureHTTPErrorHandler creates a secure error handler using the provided formatter
+// This is the recommended way to handle errors - it never exposes internal details
+func NewSecureHTTPErrorHandler(formatter ErrorFormatter) HTTPErrorHandler {
+	return func(w http.ResponseWriter, r *http.Request, err error, result *ratelimit.Result) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable) // 503 instead of 500 for rate limiting issues
+
+		// Determine error type based on context
+		errorType := ErrorTypeInternal
+		if result == nil {
+			// If we don't have a result, it's likely an extraction error
+			errorType = ErrorTypeExtraction
+		} else {
+			// We have a result but got an error, so it's a rate limiting error
+			errorType = ErrorTypeRateLimit
 		}
-		return ratelimit.ScopeGlobal
+
+		// Format error safely - never expose internal details
+		safeMessage := formatter.FormatError(err, errorType)
+
+		response := map[string]interface{}{
+			"error": safeMessage,
+		}
+
+		json.NewEncoder(w).Encode(response)
 	}
-}
-
-// DefaultHTTPErrorHandler provides a default error handler for HTTP middleware
-func DefaultHTTPErrorHandler(w http.ResponseWriter, r *http.Request, err error, result *ratelimit.Result) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusInternalServerError)
-
-	response := map[string]interface{}{
-		"error":   "Rate limiting error",
-		"details": err.Error(),
-	}
-
-	json.NewEncoder(w).Encode(response)
 }
 
 // getClientIP extracts the client IP address from the request
@@ -369,17 +470,69 @@ func getClientIP(r *http.Request) string {
 }
 
 // DefaultHTTPMiddlewareConfig returns a default configuration for HTTP middleware
+// This configuration uses secure error handling that never exposes internal details
 func DefaultHTTPMiddlewareConfig(limiter ratelimit.RateLimiter) *HTTPMiddlewareConfig {
+	formatter := &DefaultErrorFormatter{
+		ExposeDetails: false, // SECURITY: Never expose details in production
+	}
+
 	return &HTTPMiddlewareConfig{
-		Limiter:         limiter,
-		EntityExtractor: DefaultIPEntityExtractor,
-		ScopeExtractor:  nil, // Use global scope by default
-		ErrorHandler:    DefaultHTTPErrorHandler,
-		AddHeaders:      true,
+		Limiter:          limiter,
+		ContextExtractor: DefaultIPContextExtractor,
+		ErrorFormatter:   formatter,
+		ErrorHandler:     NewSecureHTTPErrorHandler(formatter),
+		AddHeaders:       true,
 		SkipPaths: []string{
 			"/health",
 			"/metrics",
 			"/ready",
 		},
 	}
+}
+
+// ============================================================================
+// ONE-LINER HELPERS - Dead simple middleware creation
+// ============================================================================
+
+// IPLimit creates IP-based rate limiting middleware in one line
+// Perfect for quick prototyping and simple use cases
+//
+// Example:
+//
+//	http.Handle("/api/", middleware.IPLimit(limiter, myHandler))
+func IPLimit(limiter ratelimit.RateLimiter, next http.Handler) http.Handler {
+	m, _ := NewHTTPMiddleware(&HTTPMiddlewareConfig{
+		Limiter:          limiter,
+		ContextExtractor: DefaultIPContextExtractor,
+		AddHeaders:       true,
+	})
+	return m.Middleware(next)
+}
+
+// APIKeyLimit creates API key-based rate limiting middleware in one line
+// Extracts API key from the specified header
+//
+// Example:
+//
+//	http.Handle("/api/", middleware.APIKeyLimit(limiter, "X-API-Key", getTierFunc, myHandler))
+func APIKeyLimit(limiter ratelimit.RateLimiter, headerName string, getTier func(string) string, next http.Handler) http.Handler {
+	m, _ := NewHTTPMiddleware(&HTTPMiddlewareConfig{
+		Limiter:          limiter,
+		ContextExtractor: APIKeyContextExtractor(headerName, getTier),
+		AddHeaders:       true,
+	})
+	return m.Middleware(next)
+}
+
+// QuickLimit creates a complete rate limiter + middleware in one line
+// Creates an in-memory store, limiter, and middleware all at once
+// WARNING: In-memory store - not suitable for multi-instance deployments
+//
+// Example:
+//
+//	http.Handle("/api/", middleware.QuickLimit(100, time.Minute, myHandler))
+func QuickLimit(limit int64, window time.Duration, next http.Handler) http.Handler {
+	store, _ := stores.NewMemoryStore(nil)
+	limiter, _ := ratelimit.NewSimple(store, limit, window)
+	return IPLimit(limiter, next)
 }

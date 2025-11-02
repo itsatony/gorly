@@ -38,9 +38,27 @@ type Store interface {
 	// Exists checks if a key exists in the store
 	Exists(ctx context.Context, key string) (bool, error)
 
+	// ExecuteScript executes a Lua script atomically in the store
+	// This enables complex atomic operations for race-free rate limiting
+	// Returns the script result as interface{} which must be type-asserted by caller
+	// Returns ErrScriptNotSupported if the store doesn't support scripting
+	ExecuteScript(ctx context.Context, script string, keys []string, args ...interface{}) (interface{}, error)
+
 	// Health checks the health of the store connection
 	Health(ctx context.Context) error
 
 	// Close closes the store connection
 	Close() error
+}
+
+// ScriptSupporter is an optional interface for stores that support Lua scripts
+// Stores can implement this to provide script caching and optimization
+type ScriptSupporter interface {
+	Store
+	// LoadScript pre-loads a script and returns its SHA1 hash for later execution
+	// This enables using EVALSHA instead of EVAL for better performance
+	LoadScript(ctx context.Context, script string) (string, error)
+
+	// ExecuteScriptSHA executes a pre-loaded script by its SHA1 hash
+	ExecuteScriptSHA(ctx context.Context, sha string, keys []string, args ...interface{}) (interface{}, error)
 }

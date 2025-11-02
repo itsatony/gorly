@@ -16,6 +16,7 @@
 coverage.*
 *.coverprofile
 profile.cov
+coverage_report.html
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -30,3 +31,20 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Temporary assessment and analysis files
+*ASSESSMENT*.md
+*PRODUCTION_READINESS*.md
+*TEST_ANALYSIS*.md
+*TEST_COVERAGE*.md
+*TEST_EXECUTION*.md
+*TEST_REPORT*.md
+*_REPORT.txt
+*_SUMMARY.txt
+*_ANALYSIS.txt
+
+# Build artifacts and binaries in root
+/basic
+/builder
+/main
+*.bak

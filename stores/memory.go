@@ -1,541 +1,512 @@
-// stores/memory.go
 package stores
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
+
+	ratelimit "github.com/itsatony/gorly"
+	nuts "github.com/vaudience/go-nuts"
 )
 
-// MemoryConfig configures memory store settings
-type MemoryConfig struct {
-	MaxKeys         int           `yaml:"max_keys" json:"max_keys" mapstructure:"max_keys"`                         // Maximum number of keys to store (0 for unlimited)
-	CleanupInterval time.Duration `yaml:"cleanup_interval" json:"cleanup_interval" mapstructure:"cleanup_interval"` // How often to clean up expired keys
-	DefaultTTL      time.Duration `yaml:"default_ttl" json:"default_ttl" mapstructure:"default_ttl"`                // Default TTL for keys without explicit expiration
-}
+// ============================================================================
+// MEMORY STORE - Thread-safe in-memory store with sharding
+// ============================================================================
+//
+// ⚠️  WARNING: NOT FOR PRODUCTION USE ⚠️
+//
+// The MemoryStore has CRITICAL LIMITATIONS that make it unsuitable for production:
+//
+// 1. RACE CONDITIONS (P0 Security): Non-atomic read-modify-write operations
+//    can allow concurrent requests to bypass rate limits in high-traffic scenarios
+//
+// 2. NO SHARED STATE (P0 Availability): Each server instance maintains separate
+//    state, multiplying effective rate limits by instance count (3 servers = 3x limit)
+//
+// 3. NO PERSISTENCE (P0 Availability): All rate limit state is lost on restart,
+//    allowing users to reset quotas by waiting for restarts
+//
+// 4. MEMORY LEAKS (P1 Stability): High cardinality keys (many unique IPs/users)
+//    can cause unbounded memory growth leading to OOM
+//
+// 5. NO ATOMIC OPERATIONS (P0 Security): Race condition window between Get/Set
+//    operations enables rate limit bypasses under load
+//
+// ✅ USE REDIS STORE FOR PRODUCTION
+//
+// The Redis store provides:
+// - Atomic Lua script execution (eliminates race conditions)
+// - Shared state across all server instances
+// - Persistence and crash recovery
+// - Automatic TTL-based expiration
+// - Battle-tested scalability
+//
+// See stores/PRODUCTION_SAFETY.md for detailed analysis and migration guide.
+//
+// ✅ ACCEPTABLE USE CASES FOR MEMORY STORE:
+// - Development and testing
+// - Single-instance, low-traffic applications (<100 req/s)
+// - Non-critical rate limiting (e.g., internal tools)
+// - Emergency fallback when Redis is unavailable
+//
+// ============================================================================
 
-// MemoryItem represents a stored item with metadata
-type MemoryItem struct {
-	Value     []byte
-	ExpiresAt time.Time
-	CreatedAt time.Time
-}
-
-// IsExpired checks if the item has expired
-func (mi *MemoryItem) IsExpired() bool {
-	return !mi.ExpiresAt.IsZero() && time.Now().After(mi.ExpiresAt)
-}
-
-// MemoryStore implements the Store interface using in-memory storage
+// MemoryStore implements Store interface using in-memory storage with sharding
+// Thread-safe with automatic expiration cleanup
+//
+// WARNING: See package documentation above for critical production limitations
 type MemoryStore struct {
-	mu             sync.RWMutex
-	data           map[string]*MemoryItem
-	config         MemoryConfig
-	cleanupTicker  *time.Ticker
-	cleanupStop    chan struct{}
-	cleanupRunning bool
+	shards        []*shard
+	shardCount    int
+	cleanupTicker *time.Ticker
+	stopCleanup   chan struct{}
+	closed        bool
+	closeMu       sync.RWMutex
+	logger        ratelimit.Logger
+	id            string
+}
 
-	// Statistics (protected by separate mutex to avoid read/write lock conflicts)
-	statsMu sync.Mutex
-	stats   struct {
-		gets    int64
-		sets    int64
-		deletes int64
-		hits    int64
-		misses  int64
-		expired int64
-		evicted int64
+// shard represents a single shard of the memory store
+type shard struct {
+	mu      sync.RWMutex
+	data    map[string][]byte
+	expires map[string]time.Time
+}
+
+// entry represents a stored value with metadata
+type entry struct {
+	Value     []byte    `json:"value"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+// MemoryStoreConfig configures the memory store
+type MemoryStoreConfig struct {
+	// ShardCount is the number of shards for concurrent access
+	// Higher values improve concurrency but use more memory
+	ShardCount int
+
+	// CleanupInterval is how often to clean up expired entries
+	CleanupInterval time.Duration
+
+	// MaxKeys is the maximum number of keys per shard (0 = unlimited)
+	MaxKeys int
+
+	// Logger for store operations (optional)
+	Logger ratelimit.Logger
+}
+
+// DefaultMemoryStoreConfig returns default configuration
+func DefaultMemoryStoreConfig() *MemoryStoreConfig {
+	return &MemoryStoreConfig{
+		ShardCount:      int(ratelimit.DefaultShardCount),
+		CleanupInterval: time.Duration(ratelimit.DefaultCleanupIntervalSeconds) * time.Second,
+		MaxKeys:         int(ratelimit.DefaultMaxKeys),
+		Logger:          ratelimit.NewNopLogger(),
 	}
 }
+
+// Validate validates the configuration
+func (c *MemoryStoreConfig) Validate() error {
+	if c.ShardCount < 1 {
+		return ratelimit.WrapConfigError(nil, "shard count must be at least 1",
+			"shard_count", c.ShardCount)
+	}
+	if c.CleanupInterval < time.Second {
+		return ratelimit.WrapConfigError(nil, "cleanup interval must be at least 1 second",
+			"cleanup_interval", c.CleanupInterval)
+	}
+	return nil
+}
+
+// ============================================================================
+// CONSTRUCTOR
+// ============================================================================
 
 // NewMemoryStore creates a new in-memory store
-func NewMemoryStore(config MemoryConfig) (*MemoryStore, error) {
-	// Set defaults
-	if config.MaxKeys == 0 {
-		config.MaxKeys = 1000000 // 1M keys default limit
-	}
-	if config.CleanupInterval == 0 {
-		config.CleanupInterval = 5 * time.Minute // Cleanup every 5 minutes
-	}
-	if config.DefaultTTL == 0 {
-		config.DefaultTTL = time.Hour // 1 hour default TTL
-	}
-
-	store := &MemoryStore{
-		data:        make(map[string]*MemoryItem),
-		config:      config,
-		cleanupStop: make(chan struct{}),
-	}
-
-	// Start cleanup goroutine
-	store.startCleanup()
-
-	return store, nil
-}
-
-// Get retrieves a value from memory
-func (m *MemoryStore) Get(ctx context.Context, key string) ([]byte, error) {
-	// Update stats first
-	m.statsMu.Lock()
-	m.stats.gets++
-	m.statsMu.Unlock()
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	item, exists := m.data[key]
-	if !exists {
-		m.statsMu.Lock()
-		m.stats.misses++
-		m.statsMu.Unlock()
-		return nil, NewStoreError(
-			"store",
-			"key not found",
-			nil,
-		)
+//
+// ⚠️  WARNING: NOT FOR PRODUCTION USE ⚠️
+//
+// MemoryStore has critical limitations (race conditions, no shared state,
+// no persistence) that make it unsuitable for production deployments.
+//
+// FOR PRODUCTION: Use NewRedisStore() instead
+// See stores/PRODUCTION_SAFETY.md for detailed comparison and migration guide
+//
+// ONLY use MemoryStore for:
+// - Development and testing
+// - Single-instance, low-traffic applications
+// - Non-critical internal tools
+func NewMemoryStore(config *MemoryStoreConfig) (*MemoryStore, error) {
+	if config == nil {
+		config = DefaultMemoryStoreConfig()
 	}
 
-	// Check if expired
-	if item.IsExpired() {
-		m.statsMu.Lock()
-		m.stats.misses++
-		m.stats.expired++
-		m.statsMu.Unlock()
-		// Note: We don't delete expired items here to avoid lock upgrade
-		// They'll be cleaned up by the cleanup goroutine
-		return nil, NewStoreError(
-			"store",
-			"key not found",
-			nil,
-		)
+	if err := config.Validate(); err != nil {
+		return nil, err
 	}
 
-	m.statsMu.Lock()
-	m.stats.hits++
-	m.statsMu.Unlock()
+	ms := &MemoryStore{
+		shardCount:  config.ShardCount,
+		shards:      make([]*shard, config.ShardCount),
+		stopCleanup: make(chan struct{}),
+		logger:      config.Logger,
+		id:          nuts.NID(ratelimit.IDPrefixRateLimiter, 16),
+	}
 
-	// Return a copy to prevent external modification
-	result := make([]byte, len(item.Value))
-	copy(result, item.Value)
-	return result, nil
-}
-
-// Set stores a value in memory with optional expiration
-func (m *MemoryStore) Set(ctx context.Context, key string, value []byte, expiration time.Duration) error {
-	// Update stats
-	m.statsMu.Lock()
-	m.stats.sets++
-	m.statsMu.Unlock()
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Check if we need to evict items due to max keys limit
-	if len(m.data) >= m.config.MaxKeys {
-		if err := m.evictLRU(); err != nil {
-			return err
+	// Initialize shards
+	for i := 0; i < config.ShardCount; i++ {
+		ms.shards[i] = &shard{
+			data:    make(map[string][]byte),
+			expires: make(map[string]time.Time),
 		}
 	}
 
-	// Calculate expiration time
-	var expiresAt time.Time
-	if expiration > 0 {
-		expiresAt = time.Now().Add(expiration)
-	} else if m.config.DefaultTTL > 0 {
-		expiresAt = time.Now().Add(m.config.DefaultTTL)
+	// Start cleanup goroutine
+	ms.cleanupTicker = time.NewTicker(config.CleanupInterval)
+	go ms.cleanupLoop()
+
+	ms.logger.Info("memory store created",
+		"id", ms.id,
+		"shards", config.ShardCount,
+		"cleanup_interval", config.CleanupInterval,
+	)
+
+	return ms, nil
+}
+
+// ============================================================================
+// STORE INTERFACE IMPLEMENTATION
+// ============================================================================
+
+// Get retrieves a value from the store
+func (ms *MemoryStore) Get(ctx context.Context, key string) ([]byte, error) {
+	if err := ms.checkClosed(); err != nil {
+		return nil, err
 	}
+
+	// Validate key length to prevent DOS attacks
+	if err := ratelimit.ValidateKeyLength(key); err != nil {
+		return nil, err
+	}
+
+	shard := ms.getShard(key)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+
+	// Check expiration
+	if expiry, exists := shard.expires[key]; exists && time.Now().After(expiry) {
+		return nil, ratelimit.ErrKeyNotFound
+	}
+
+	value, exists := shard.data[key]
+	if !exists {
+		return nil, ratelimit.ErrKeyNotFound
+	}
+
+	// Return a copy to prevent external modification
+	result := make([]byte, len(value))
+	copy(result, value)
+	return result, nil
+}
+
+// Set stores a value in the store with optional expiration
+func (ms *MemoryStore) Set(ctx context.Context, key string, value []byte, expiration time.Duration) error {
+	if err := ms.checkClosed(); err != nil {
+		return err
+	}
+
+	// Validate key length to prevent DOS attacks
+	if err := ratelimit.ValidateKeyLength(key); err != nil {
+		return err
+	}
+
+	shard := ms.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
 	// Store a copy to prevent external modification
 	valueCopy := make([]byte, len(value))
 	copy(valueCopy, value)
+	shard.data[key] = valueCopy
 
-	m.data[key] = &MemoryItem{
-		Value:     valueCopy,
-		ExpiresAt: expiresAt,
-		CreatedAt: time.Now(),
+	if expiration > 0 {
+		shard.expires[key] = time.Now().Add(expiration)
+	} else {
+		delete(shard.expires, key)
 	}
 
 	return nil
 }
 
 // Increment atomically increments a counter and returns the new value
-func (m *MemoryStore) Increment(ctx context.Context, key string, expiration time.Duration) (int64, error) {
-	return m.IncrementBy(ctx, key, 1, expiration)
+func (ms *MemoryStore) Increment(ctx context.Context, key string, expiration time.Duration) (int64, error) {
+	return ms.IncrementBy(ctx, key, 1, expiration)
 }
 
 // IncrementBy atomically increments a counter by the given amount
-func (m *MemoryStore) IncrementBy(ctx context.Context, key string, amount int64, expiration time.Duration) (int64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	item, exists := m.data[key]
-	var currentValue int64 = 0
-
-	// If item exists and not expired, try to parse its value
-	if exists && !item.IsExpired() {
-		if len(item.Value) == 8 {
-			// Assume it's a 64-bit integer stored in binary format
-			for i := 0; i < 8; i++ {
-				currentValue |= int64(item.Value[i]) << (8 * (7 - i))
-			}
-		}
-	}
-
-	// Increment the value
-	newValue := currentValue + amount
-
-	// Convert to bytes (big-endian)
-	valueBytes := make([]byte, 8)
-	for i := 0; i < 8; i++ {
-		valueBytes[i] = byte(newValue >> (8 * (7 - i)))
-	}
-
-	// Store the new value
-	if err := m.setWithLock(key, valueBytes, expiration); err != nil {
+func (ms *MemoryStore) IncrementBy(ctx context.Context, key string, amount int64, expiration time.Duration) (int64, error) {
+	if err := ms.checkClosed(); err != nil {
 		return 0, err
 	}
 
-	return newValue, nil
-}
+	// Validate key length to prevent DOS attacks
+	if err := ratelimit.ValidateKeyLength(key); err != nil {
+		return 0, err
+	}
 
-// setWithLock is an internal method that assumes the mutex is already held
-func (m *MemoryStore) setWithLock(key string, value []byte, expiration time.Duration) error {
-	// Check if we need to evict items due to max keys limit
-	if len(m.data) >= m.config.MaxKeys {
-		if err := m.evictLRU(); err != nil {
-			return err
+	shard := ms.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	// Check expiration and clean up if expired
+	if expiry, exists := shard.expires[key]; exists && time.Now().After(expiry) {
+		delete(shard.data, key)
+		delete(shard.expires, key)
+	}
+
+	// Get current value using binary encoding (much faster than JSON for int64)
+	// This entire operation is atomic due to the shard lock held above
+	var current int64
+	if data, exists := shard.data[key]; exists {
+		// Decode int64 from binary (8 bytes, big-endian)
+		if len(data) >= 8 {
+			current = int64(binary.BigEndian.Uint64(data))
+		} else {
+			// Fallback to JSON for backward compatibility (if data was stored as JSON)
+			if err := json.Unmarshal(data, &current); err != nil {
+				return 0, ratelimit.WrapStorageError(err, "increment",
+					"key", key, "action", "decode")
+			}
 		}
 	}
 
-	// Calculate expiration time
-	var expiresAt time.Time
+	// Increment (still under lock, so atomic)
+	current += amount
+
+	// Store new value using binary encoding (8 bytes for int64)
+	data := make([]byte, 8)
+	binary.BigEndian.PutUint64(data, uint64(current))
+	shard.data[key] = data
+
+	// Update expiration
 	if expiration > 0 {
-		expiresAt = time.Now().Add(expiration)
-	} else if m.config.DefaultTTL > 0 {
-		expiresAt = time.Now().Add(m.config.DefaultTTL)
+		shard.expires[key] = time.Now().Add(expiration)
 	}
 
-	// Store a copy to prevent external modification
-	valueCopy := make([]byte, len(value))
-	copy(valueCopy, value)
+	return current, nil
+}
 
-	m.data[key] = &MemoryItem{
-		Value:     valueCopy,
-		ExpiresAt: expiresAt,
-		CreatedAt: time.Now(),
+// Delete removes a key from the store
+func (ms *MemoryStore) Delete(ctx context.Context, key string) error {
+	if err := ms.checkClosed(); err != nil {
+		return err
 	}
 
+	// Validate key length to prevent DOS attacks
+	if err := ratelimit.ValidateKeyLength(key); err != nil {
+		return err
+	}
+
+	shard := ms.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	delete(shard.data, key)
+	delete(shard.expires, key)
 	return nil
 }
 
-// Delete removes a key from memory
-func (m *MemoryStore) Delete(ctx context.Context, key string) error {
-	// Update stats
-	m.statsMu.Lock()
-	m.stats.deletes++
-	m.statsMu.Unlock()
+// Exists checks if a key exists in the store
+func (ms *MemoryStore) Exists(ctx context.Context, key string) (bool, error) {
+	if err := ms.checkClosed(); err != nil {
+		return false, err
+	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// Validate key length to prevent DOS attacks
+	if err := ratelimit.ValidateKeyLength(key); err != nil {
+		return false, err
+	}
 
-	delete(m.data, key)
-	return nil
-}
+	shard := ms.getShard(key)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
 
-// Exists checks if a key exists in memory
-func (m *MemoryStore) Exists(ctx context.Context, key string) (bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	item, exists := m.data[key]
-	if !exists {
+	// Check expiration
+	if expiry, exists := shard.expires[key]; exists && time.Now().After(expiry) {
 		return false, nil
 	}
 
-	// Check if expired
-	if item.IsExpired() {
-		return false, nil
-	}
-
-	return true, nil
+	_, exists := shard.data[key]
+	return exists, nil
 }
 
-// Health checks the health of the memory store (always healthy)
-func (m *MemoryStore) Health(ctx context.Context) error {
+// ExecuteScript returns ErrScriptNotSupported for memory store
+// Memory store does not support Lua scripts - use Redis for atomic operations
+// WARNING: Memory store has race conditions in concurrent scenarios
+func (ms *MemoryStore) ExecuteScript(ctx context.Context, script string, keys []string, args ...interface{}) (interface{}, error) {
+	return nil, ratelimit.ErrScriptNotSupported
+}
+
+// Health checks the health of the store
+func (ms *MemoryStore) Health(ctx context.Context) error {
+	if err := ms.checkClosed(); err != nil {
+		return err
+	}
 	return nil
 }
 
-// Close cleans up resources used by the memory store
-func (m *MemoryStore) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// Close cleanly shuts down the store
+func (ms *MemoryStore) Close() error {
+	ms.closeMu.Lock()
+	defer ms.closeMu.Unlock()
 
-	// Stop cleanup goroutine
-	m.stopCleanup()
-
-	// Clear all data
-	m.data = nil
-
-	return nil
-}
-
-// MultiGet retrieves multiple values at once
-func (m *MemoryStore) MultiGet(ctx context.Context, keys []string) (map[string][]byte, error) {
-	if len(keys) == 0 {
-		return make(map[string][]byte), nil
-	}
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	result := make(map[string][]byte)
-	for _, key := range keys {
-		item, exists := m.data[key]
-		if exists && !item.IsExpired() {
-			// Return a copy to prevent external modification
-			valueCopy := make([]byte, len(item.Value))
-			copy(valueCopy, item.Value)
-			result[key] = valueCopy
-		}
-	}
-
-	return result, nil
-}
-
-// MultiSet sets multiple values at once
-func (m *MemoryStore) MultiSet(ctx context.Context, keyValues map[string][]byte, expiration time.Duration) error {
-	if len(keyValues) == 0 {
+	if ms.closed {
 		return nil
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	ms.closed = true
 
-	for key, value := range keyValues {
-		if err := m.setWithLock(key, value, expiration); err != nil {
-			return err
-		}
+	// Stop cleanup goroutine
+	close(ms.stopCleanup)
+	if ms.cleanupTicker != nil {
+		ms.cleanupTicker.Stop()
 	}
 
+	// Clear all shards
+	for _, shard := range ms.shards {
+		shard.mu.Lock()
+		shard.data = nil
+		shard.expires = nil
+		shard.mu.Unlock()
+	}
+
+	ms.logger.Info("memory store closed", "id", ms.id)
 	return nil
 }
 
-// IncrementMulti atomically increments multiple counters
-func (m *MemoryStore) IncrementMulti(ctx context.Context, keys []string, amounts []int64, expiration time.Duration) (map[string]int64, error) {
-	if len(keys) != len(amounts) {
-		return nil, NewStoreError(
-			"config",
-			"keys and amounts arrays must have the same length",
-			nil,
-		)
+// ============================================================================
+// INTERNAL HELPERS
+// ============================================================================
+
+// getShard returns the shard for the given key using consistent hashing
+func (ms *MemoryStore) getShard(key string) *shard {
+	// Simple hash function - sum of byte values
+	hash := uint32(0)
+	for i := 0; i < len(key); i++ {
+		hash = hash*31 + uint32(key[i])
 	}
-
-	if len(keys) == 0 {
-		return make(map[string]int64), nil
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	result := make(map[string]int64)
-	for i, key := range keys {
-		item, exists := m.data[key]
-		var currentValue int64 = 0
-
-		// If item exists and not expired, try to parse its value
-		if exists && !item.IsExpired() {
-			if len(item.Value) == 8 {
-				// Assume it's a 64-bit integer stored in binary format
-				for j := 0; j < 8; j++ {
-					currentValue |= int64(item.Value[j]) << (8 * (7 - j))
-				}
-			}
-		}
-
-		// Increment the value
-		newValue := currentValue + amounts[i]
-
-		// Convert to bytes (big-endian)
-		valueBytes := make([]byte, 8)
-		for j := 0; j < 8; j++ {
-			valueBytes[j] = byte(newValue >> (8 * (7 - j)))
-		}
-
-		// Store the new value
-		if err := m.setWithLock(key, valueBytes, expiration); err != nil {
-			return nil, err
-		}
-
-		result[key] = newValue
-	}
-
-	return result, nil
+	return ms.shards[hash%uint32(ms.shardCount)]
 }
 
-// TTL returns the time-to-live for a key
-func (m *MemoryStore) TTL(ctx context.Context, key string) (time.Duration, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+// checkClosed checks if the store is closed
+func (ms *MemoryStore) checkClosed() error {
+	ms.closeMu.RLock()
+	defer ms.closeMu.RUnlock()
 
-	item, exists := m.data[key]
-	if !exists || item.IsExpired() {
-		return -2 * time.Second, nil // Redis convention: -2 means key doesn't exist
+	if ms.closed {
+		return ratelimit.ErrClosed
 	}
-
-	if item.ExpiresAt.IsZero() {
-		return -1 * time.Second, nil // Redis convention: -1 means no expiration
-	}
-
-	remaining := time.Until(item.ExpiresAt)
-	if remaining <= 0 {
-		return -2 * time.Second, nil // Already expired
-	}
-
-	return remaining, nil
-}
-
-// Expire sets an expiration time for a key
-func (m *MemoryStore) Expire(ctx context.Context, key string, expiration time.Duration) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	item, exists := m.data[key]
-	if !exists || item.IsExpired() {
-		return NewStoreError(
-			"store",
-			"key not found",
-			nil,
-		)
-	}
-
-	// Update expiration time
-	item.ExpiresAt = time.Now().Add(expiration)
 	return nil
 }
 
-// Stats returns memory store statistics
-func (m *MemoryStore) Stats() map[string]interface{} {
-	m.mu.RLock()
-	totalKeys := len(m.data)
-	m.mu.RUnlock()
-
-	m.statsMu.Lock()
-	statsCopy := m.stats
-	m.statsMu.Unlock()
-
-	return map[string]interface{}{
-		"total_keys":       totalKeys,
-		"gets":             statsCopy.gets,
-		"sets":             statsCopy.sets,
-		"deletes":          statsCopy.deletes,
-		"hits":             statsCopy.hits,
-		"misses":           statsCopy.misses,
-		"expired":          statsCopy.expired,
-		"evicted":          statsCopy.evicted,
-		"max_keys":         m.config.MaxKeys,
-		"cleanup_interval": m.config.CleanupInterval.String(),
-		"default_ttl":      m.config.DefaultTTL.String(),
-	}
-}
-
-// startCleanup starts the background cleanup goroutine
-func (m *MemoryStore) startCleanup() {
-	if m.config.CleanupInterval <= 0 {
-		return // Cleanup disabled
-	}
-
-	m.cleanupTicker = time.NewTicker(m.config.CleanupInterval)
-	m.cleanupRunning = true
-
-	go func() {
-		for {
-			select {
-			case <-m.cleanupTicker.C:
-				m.cleanupExpired()
-			case <-m.cleanupStop:
-				return
-			}
-		}
-	}()
-}
-
-// stopCleanup stops the background cleanup goroutine
-func (m *MemoryStore) stopCleanup() {
-	if m.cleanupRunning {
-		m.cleanupRunning = false
-		close(m.cleanupStop)
-		if m.cleanupTicker != nil {
-			m.cleanupTicker.Stop()
+// cleanupLoop periodically cleans up expired entries
+func (ms *MemoryStore) cleanupLoop() {
+	for {
+		select {
+		case <-ms.cleanupTicker.C:
+			ms.cleanup()
+		case <-ms.stopCleanup:
+			return
 		}
 	}
 }
 
-// cleanupExpired removes expired items from memory
-func (m *MemoryStore) cleanupExpired() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
+// cleanup removes expired entries from all shards
+func (ms *MemoryStore) cleanup() {
 	now := time.Now()
-	expiredCount := int64(0)
-	for key, item := range m.data {
-		if !item.ExpiresAt.IsZero() && now.After(item.ExpiresAt) {
-			delete(m.data, key)
-			expiredCount++
+	totalCleaned := 0
+
+	ms.logger.Debug("starting cleanup", "id", ms.id)
+
+	for shardIdx, shard := range ms.shards {
+		shard.mu.Lock()
+
+		keysToDelete := make([]string, 0)
+		for key, expiry := range shard.expires {
+			if now.After(expiry) {
+				keysToDelete = append(keysToDelete, key)
+			}
+		}
+
+		for _, key := range keysToDelete {
+			delete(shard.data, key)
+			delete(shard.expires, key)
+			totalCleaned++
+		}
+
+		shard.mu.Unlock()
+
+		if len(keysToDelete) > 0 {
+			ms.logger.Debug("cleaned shard",
+				"id", ms.id,
+				"shard", shardIdx,
+				"cleaned", len(keysToDelete),
+			)
 		}
 	}
 
-	// Update stats if any items were expired
-	if expiredCount > 0 {
-		m.statsMu.Lock()
-		m.stats.expired += expiredCount
-		m.statsMu.Unlock()
+	if totalCleaned > 0 {
+		ms.logger.Info("cleanup completed",
+			"id", ms.id,
+			"total_cleaned", totalCleaned,
+		)
 	}
 }
 
-// evictLRU evicts the least recently used items to make room for new ones
-func (m *MemoryStore) evictLRU() error {
-	// Find the oldest item by CreatedAt
-	var oldestKey string
-	var oldestTime time.Time
+// ============================================================================
+// STATISTICS & MONITORING
+// ============================================================================
 
-	for key, item := range m.data {
-		if oldestKey == "" || item.CreatedAt.Before(oldestTime) {
-			oldestKey = key
-			oldestTime = item.CreatedAt
-		}
-	}
-
-	if oldestKey != "" {
-		delete(m.data, oldestKey)
-		m.statsMu.Lock()
-		m.stats.evicted++
-		m.statsMu.Unlock()
-	}
-
-	return nil
+// Stats returns statistics about the memory store
+type MemoryStoreStats struct {
+	ID            string `json:"id"`
+	ShardCount    int    `json:"shard_count"`
+	TotalKeys     int    `json:"total_keys"`
+	TotalExpiring int    `json:"total_expiring"`
+	Closed        bool   `json:"closed"`
 }
 
-// Clear removes all items from the store (useful for testing)
-func (m *MemoryStore) Clear() {
-	m.mu.Lock()
-	m.data = make(map[string]*MemoryItem)
-	m.mu.Unlock()
+// Stats returns statistics about the store
+func (ms *MemoryStore) Stats() *MemoryStoreStats {
+	ms.closeMu.RLock()
+	defer ms.closeMu.RUnlock()
 
-	// Reset stats
-	m.statsMu.Lock()
-	m.stats.gets = 0
-	m.stats.sets = 0
-	m.stats.deletes = 0
-	m.stats.hits = 0
-	m.stats.misses = 0
-	m.stats.expired = 0
-	m.stats.evicted = 0
-	m.statsMu.Unlock()
+	stats := &MemoryStoreStats{
+		ID:         ms.id,
+		ShardCount: ms.shardCount,
+		Closed:     ms.closed,
+	}
+
+	for _, shard := range ms.shards {
+		shard.mu.RLock()
+		stats.TotalKeys += len(shard.data)
+		stats.TotalExpiring += len(shard.expires)
+		shard.mu.RUnlock()
+	}
+
+	return stats
 }
 
-// Size returns the current number of items in the store
-func (m *MemoryStore) Size() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.data)
+// String returns a string representation of the store
+func (ms *MemoryStore) String() string {
+	stats := ms.Stats()
+	return fmt.Sprintf("MemoryStore{id=%s, shards=%d, keys=%d, expiring=%d, closed=%v}",
+		stats.ID, stats.ShardCount, stats.TotalKeys, stats.TotalExpiring, stats.Closed)
 }

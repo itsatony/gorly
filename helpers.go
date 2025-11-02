@@ -1,344 +1,481 @@
-// Package ratelimit provides helper utilities for common rate limiting patterns
 package ratelimit
 
 import (
 	"context"
-	"fmt"
-	"net/http"
-	"strings"
 	"time"
 )
 
-// Common extractor functions for testing and development
+// ============================================================================
+// CONVENIENCE CONSTRUCTORS
+// ============================================================================
 
-// ExtractIP extracts IP address from request with proxy support
-func ExtractIP(r *http.Request) string {
-	// Try X-Forwarded-For first (supports multiple proxies)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
+// NewSimple creates a rate limiter with the simplest possible configuration
+// Requires a store to be provided (use stores.NewMemoryStore(nil) for in-memory storage)
+//
+// Example:
+//
+//	store := stores.NewMemoryStore(nil)
+//	limiter, err := ratelimit.NewSimple(store, 100, time.Hour)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	defer limiter.Close()
+func NewSimple(store Store, limit int64, window time.Duration) (RateLimiter, error) {
+	if store == nil {
+		return nil, WrapConfigError(nil, "store is required")
 	}
 
-	// Try X-Real-IP
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
+	config := &Config{
+		Store:         store,
+		Algorithm:     NewTokenBucketAlgorithm(),
+		DefaultLimit:  limit,
+		DefaultWindow: window,
+		DefaultBurst:  limit / 10, // 10% of limit as burst
+		Logger:        NewNopLogger(),
 	}
 
-	// Use RemoteAddr as fallback
-	parts := strings.Split(r.RemoteAddr, ":")
-	return parts[0]
+	return NewRateLimiter(config)
 }
 
-// ExtractAPIKey extracts API key from various headers and query parameters
-func ExtractAPIKey(r *http.Request) string {
-	// Try Authorization header (Bearer token)
-	if auth := r.Header.Get("Authorization"); auth != "" {
-		if strings.HasPrefix(auth, "Bearer ") {
-			return strings.TrimPrefix(auth, "Bearer ")
-		}
-		if strings.HasPrefix(auth, "Token ") {
-			return strings.TrimPrefix(auth, "Token ")
-		}
+// NewWithConfig creates a rate limiter with the given configuration
+// Fills in sensible defaults for any missing values
+//
+// Example:
+//
+//	store := stores.NewMemoryStore(nil)
+//	limiter, err := ratelimit.NewWithConfig(&ratelimit.Config{
+//	    Store:         store,
+//	    DefaultLimit:  1000,
+//	    DefaultWindow: time.Hour,
+//	    DefaultBurst:  100,
+//	})
+func NewWithConfig(config *Config) (RateLimiter, error) {
+	if config.Algorithm == nil {
+		config.Algorithm = NewTokenBucketAlgorithm()
+	}
+	if config.Logger == nil {
+		config.Logger = NewNopLogger()
 	}
 
-	// Try custom API key header
-	if apiKey := r.Header.Get("X-API-Key"); apiKey != "" {
-		return apiKey
-	}
-
-	// Try query parameter
-	if apiKey := r.URL.Query().Get("api_key"); apiKey != "" {
-		return apiKey
-	}
-
-	return ExtractIP(r) // Fallback to IP
+	return NewRateLimiter(config)
 }
 
-// ExtractUserID extracts user ID from JWT, session, or headers
-func ExtractUserID(r *http.Request) string {
-	// Try custom header first
-	if userID := r.Header.Get("X-User-ID"); userID != "" {
-		return userID
+// NewWithTiers creates a rate limiter with multi-tier support
+// Uses the provided resolver configuration for tier-based limits
+// Requires a store to be provided
+//
+// Example:
+//
+//	store := stores.NewMemoryStore(nil)
+//	resolverConfig := ratelimit.NewDefaultResolverConfig()
+//	limiter, err := ratelimit.NewWithTiers(store, resolverConfig)
+func NewWithTiers(store Store, resolverConfig *ResolverConfig) (RateLimiter, error) {
+	if store == nil {
+		return nil, WrapConfigError(nil, "store is required")
 	}
 
-	// Try session cookie (simplified)
-	if cookie, err := r.Cookie("session_id"); err == nil {
-		return "session:" + cookie.Value
+	resolver, err := NewLimitResolver(resolverConfig)
+	if err != nil {
+		return nil, WrapConfigError(err, "failed to create resolver")
 	}
 
-	// Try JWT from Authorization header (simplified)
-	if auth := r.Header.Get("Authorization"); auth != "" && strings.HasPrefix(auth, "Bearer ") {
-		token := strings.TrimPrefix(auth, "Bearer ")
-		return "jwt:" + token[:min(len(token), 16)] // Use first 16 chars as ID
+	config := &Config{
+		Store:         store,
+		Algorithm:     NewTokenBucketAlgorithm(),
+		DefaultLimit:  DefaultLimit,
+		DefaultWindow: DefaultWindow,
+		DefaultBurst:  DefaultBurst,
+		Resolver:      resolver,
+		Logger:        NewNopLogger(),
 	}
 
-	return ExtractIP(r) // Fallback to IP
+	return NewRateLimiter(config)
 }
 
-// ExtractUserTier extracts user tier information
-func ExtractUserTier(r *http.Request) string {
-	// Try explicit tier header
-	if tier := r.Header.Get("X-User-Tier"); tier != "" {
-		return tier
-	}
+// ============================================================================
+// QUICK CHECK HELPERS
+// ============================================================================
 
-	// Try to extract from API key
-	if apiKey := r.Header.Get("X-API-Key"); apiKey != "" {
-		if strings.HasPrefix(apiKey, "free-") {
-			return "free"
-		}
-		if strings.HasPrefix(apiKey, "premium-") {
-			return "premium"
-		}
-		if strings.HasPrefix(apiKey, "enterprise-") {
-			return "enterprise"
-		}
+// QuickCheck is a convenience function for simple rate limit checks
+// Returns true if the request is allowed, false if rate limited, error if operation failed
+//
+// BREAKING CHANGE: Now returns (bool, error) instead of just bool
+// This allows callers to distinguish between rate limiting and errors
+//
+// Example:
+//
+//	allowed, err := ratelimit.QuickCheck(ctx, limiter, "user123", "global", "free")
+//	if err != nil {
+//	    // Handle error (e.g., store unavailable)
+//	    return err
+//	}
+//	if !allowed {
+//	    // Rate limit exceeded
+//	    return http.StatusTooManyRequests
+//	}
+func QuickCheck(ctx context.Context, limiter RateLimiter, identity, scope, tier string) (bool, error) {
+	rlCtx := NewSimpleContext(identity, scope, tier, nil)
+	result, err := limiter.Allow(ctx, rlCtx)
+	if err != nil {
+		return false, err
 	}
-
-	return "free" // Default tier
+	return result.Allowed, nil
 }
 
-// ExtractScope extracts scope based on URL path patterns
-func ExtractScope(r *http.Request) string {
-	path := r.URL.Path
-
-	// Authentication endpoints
-	if strings.Contains(path, "/auth/") || strings.Contains(path, "/login") || strings.Contains(path, "/register") {
-		return "auth"
+// QuickCheckN is a convenience function for checking N tokens
+// Returns true if the request is allowed, false if rate limited, error if operation failed
+//
+// BREAKING CHANGE: Now returns (bool, error) instead of just bool
+func QuickCheckN(ctx context.Context, limiter RateLimiter, identity, scope, tier string, n int64) (bool, error) {
+	rlCtx := NewSimpleContext(identity, scope, tier, nil)
+	result, err := limiter.AllowN(ctx, rlCtx, n)
+	if err != nil {
+		return false, err
 	}
-
-	// Upload endpoints
-	if strings.Contains(path, "/upload") || strings.Contains(path, "/files") {
-		return "upload"
-	}
-
-	// Download endpoints
-	if strings.Contains(path, "/download") || strings.Contains(path, "/content") {
-		return "download"
-	}
-
-	// Search endpoints
-	if strings.Contains(path, "/search") || strings.Contains(path, "/query") {
-		return "search"
-	}
-
-	// Admin endpoints
-	if strings.HasPrefix(path, "/admin/") {
-		return "admin"
-	}
-
-	// API versioned endpoints
-	if strings.HasPrefix(path, "/api/v1/") {
-		return "api_v1"
-	}
-	if strings.HasPrefix(path, "/api/v2/") {
-		return "api_v2"
-	}
-
-	return "global"
+	return result.Allowed, nil
 }
 
-// Common entity extractors that combine multiple factors
-
-// ExtractEntityWithTier creates entity ID that includes tier information
-func ExtractEntityWithTier(r *http.Request) string {
-	tier := ExtractUserTier(r)
-
-	// Try to get user-specific identifier
-	if userID := ExtractUserID(r); !strings.HasPrefix(userID, "ip:") && userID != ExtractIP(r) {
-		return tier + ":" + userID
+// QuickStats returns basic usage statistics for an identity
+// Returns limit, used, remaining, and error
+//
+// BREAKING CHANGE: Now returns (int64, int64, int64, error) instead of just (int64, int64, int64)
+// Zero values no longer indicate errors - check the error return instead
+func QuickStats(ctx context.Context, limiter RateLimiter, identity, scope, tier string) (limit, used, remaining int64, err error) {
+	rlCtx := NewSimpleContext(identity, scope, tier, nil)
+	result, err := limiter.Stats(ctx, rlCtx)
+	if err != nil {
+		return 0, 0, 0, err
 	}
-
-	// Fall back to IP with tier
-	return tier + ":" + ExtractIP(r)
+	return result.Limit, result.Used, result.Remaining, nil
 }
 
-// ExtractServiceID extracts service identifier for microservice scenarios
-func ExtractServiceID(r *http.Request) string {
-	// Try service ID header
-	if serviceID := r.Header.Get("X-Service-ID"); serviceID != "" {
-		return serviceID
-	}
+// ============================================================================
+// BUILDER PATTERN
+// ============================================================================
 
-	// Try service name header
-	if serviceName := r.Header.Get("X-Service-Name"); serviceName != "" {
-		return serviceName
-	}
-
-	// Try to extract from User-Agent
-	if userAgent := r.Header.Get("User-Agent"); userAgent != "" && strings.Contains(userAgent, "service/") {
-		return userAgent
-	}
-
-	return "external:" + ExtractIP(r) // External traffic
+// Builder provides a fluent API for constructing rate limiters
+type Builder struct {
+	config *Config
+	err    error
 }
 
-// Timing utilities for rate limiting
-
-// NextWindow returns the time until the next rate limit window
-func NextWindow(windowDuration time.Duration) time.Duration {
-	now := time.Now()
-	windowStart := now.Truncate(windowDuration)
-	nextWindow := windowStart.Add(windowDuration)
-	return nextWindow.Sub(now)
-}
-
-// WindowStart returns the start time of the current window
-func WindowStart(windowDuration time.Duration) time.Time {
-	return time.Now().Truncate(windowDuration)
-}
-
-// ParseLimit parses a limit string like "100/minute" into rate and duration
-func ParseLimit(limit string) (int64, time.Duration, error) {
-	parts := strings.Split(limit, "/")
-	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("invalid limit format: %s (expected format: '100/minute')", limit)
-	}
-
-	// Parse rate
-	var rate int64
-	if _, err := fmt.Sscanf(parts[0], "%d", &rate); err != nil {
-		return 0, 0, fmt.Errorf("invalid rate: %s", parts[0])
-	}
-
-	// Parse duration
-	var duration time.Duration
-	switch strings.ToLower(parts[1]) {
-	case "second", "sec", "s":
-		duration = time.Second
-	case "minute", "min", "m":
-		duration = time.Minute
-	case "hour", "hr", "h":
-		duration = time.Hour
-	case "day", "d":
-		duration = time.Hour * 24
-	default:
-		return 0, 0, fmt.Errorf("invalid duration unit: %s", parts[1])
-	}
-
-	return rate, duration, nil
-}
-
-// FormatLimit formats rate and duration back into a limit string
-func FormatLimit(rate int64, duration time.Duration) string {
-	switch duration {
-	case time.Second:
-		return fmt.Sprintf("%d/second", rate)
-	case time.Minute:
-		return fmt.Sprintf("%d/minute", rate)
-	case time.Hour:
-		return fmt.Sprintf("%d/hour", rate)
-	case time.Hour * 24:
-		return fmt.Sprintf("%d/day", rate)
-	default:
-		return fmt.Sprintf("%d/%s", rate, duration.String())
+// NewBuilder creates a new rate limiter builder
+func NewBuilder() *Builder {
+	return &Builder{
+		config: &Config{
+			DefaultLimit:  DefaultLimit,
+			DefaultWindow: DefaultWindow,
+			DefaultBurst:  DefaultBurst,
+			Logger:        NewNopLogger(),
+		},
 	}
 }
 
-// Development helpers
-
-// DebugExtractor wraps an extractor to log entity extraction for debugging
-func DebugExtractor(extractor func(*http.Request) string, logger func(string)) func(*http.Request) string {
-	return func(r *http.Request) string {
-		entity := extractor(r)
-		logger(fmt.Sprintf("Extracted entity: %s from %s %s", entity, r.Method, r.URL.Path))
-		return entity
+// WithStore sets a custom store
+func (b *Builder) WithStore(store Store) *Builder {
+	if b.err != nil {
+		return b
 	}
-}
-
-// DebugScopeFunc wraps a scope function to log scope extraction for debugging
-func DebugScopeFunc(scopeFunc func(*http.Request) string, logger func(string)) func(*http.Request) string {
-	return func(r *http.Request) string {
-		scope := scopeFunc(r)
-		logger(fmt.Sprintf("Extracted scope: %s from %s %s", scope, r.Method, r.URL.Path))
-		return scope
-	}
-}
-
-// MockRequest creates a mock HTTP request for testing
-func MockRequest(method, path string, headers map[string]string) *http.Request {
-	req, _ := http.NewRequest(method, path, nil)
-
-	for key, value := range headers {
-		req.Header.Set(key, value)
-	}
-
-	return req
-}
-
-// Quick test utilities
-
-// QuickIPTest tests IP-based rate limiting with default parameters
-func QuickIPTest(limit string) func(t interface{}) {
-	return func(t interface{}) {
-		limiter := IPLimit(limit)
-		helper := NewTestHelper(limiter)
-
-		ctx := context.Background()
-		result := helper.TestLimit(ctx, "192.168.1.100", "global", 10, time.Millisecond*10)
-
-		if result.ActualAllow+result.ActualDeny != 10 {
-			fmt.Printf("Error: Expected 10 total requests, got %d\n", result.ActualAllow+result.ActualDeny)
-		}
-
-		fmt.Printf("Limit: %s - Allowed: %d, Denied: %d\n", limit, result.ActualAllow, result.ActualDeny)
-	}
-}
-
-// QuickAPIKeyTest tests API key-based rate limiting
-func QuickAPIKeyTest(limit string) func(t interface{}) {
-	return func(t interface{}) {
-		limiter := APIKeyLimit(limit)
-		helper := NewTestHelper(limiter)
-
-		ctx := context.Background()
-		result := helper.TestLimit(ctx, "test-api-key-123", "global", 10, time.Millisecond*10)
-
-		if result.ActualAllow+result.ActualDeny != 10 {
-			fmt.Printf("Error: Expected 10 total requests, got %d\n", result.ActualAllow+result.ActualDeny)
-		}
-
-		fmt.Printf("API Key Limit: %s - Allowed: %d, Denied: %d\n", limit, result.ActualAllow, result.ActualDeny)
-	}
-}
-
-// Utility functions
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
+	b.config.Store = store
 	return b
 }
 
-// Common test scenarios
+// WithTokenBucket sets the token bucket algorithm
+func (b *Builder) WithTokenBucket() *Builder {
+	if b.err != nil {
+		return b
+	}
+	b.config.Algorithm = NewTokenBucketAlgorithm()
+	return b
+}
 
-var CommonScenarios = []TestScenario{
-	{
-		Name:        "Burst traffic test",
-		Entity:      "burst-test-user",
-		Scope:       "global",
-		Requests:    100,
-		Interval:    0, // No interval - burst
-		ExpectAllow: 50,
-		ExpectDeny:  50,
-	},
-	{
-		Name:        "Steady traffic test",
-		Entity:      "steady-test-user",
-		Scope:       "global",
-		Requests:    20,
-		Interval:    time.Second / 20, // 20 RPS
-		ExpectAllow: 18,
-		ExpectDeny:  2,
-	},
-	{
-		Name:        "Upload stress test",
-		Entity:      "upload-test-user",
-		Scope:       "upload",
-		Requests:    10,
-		Interval:    time.Second,
-		ExpectAllow: 5,
-		ExpectDeny:  5,
-	},
+// WithSlidingWindow sets the sliding window algorithm
+func (b *Builder) WithSlidingWindow() *Builder {
+	if b.err != nil {
+		return b
+	}
+	b.config.Algorithm = NewSlidingWindowAlgorithm()
+	return b
+}
+
+// WithAlgorithm sets a custom algorithm
+func (b *Builder) WithAlgorithm(algorithm Algorithm) *Builder {
+	if b.err != nil {
+		return b
+	}
+	b.config.Algorithm = algorithm
+	return b
+}
+
+// WithLimit sets the default rate limit
+func (b *Builder) WithLimit(limit int64, window time.Duration) *Builder {
+	if b.err != nil {
+		return b
+	}
+	b.config.DefaultLimit = limit
+	b.config.DefaultWindow = window
+	return b
+}
+
+// WithLimitString sets the limit from a rate string like "1000/1h"
+func (b *Builder) WithLimitString(rateStr string) *Builder {
+	if b.err != nil {
+		return b
+	}
+	limit, window, err := ParseRateString(rateStr)
+	if err != nil {
+		b.err = err
+		return b
+	}
+	b.config.DefaultLimit = limit
+	b.config.DefaultWindow = window
+	return b
+}
+
+// WithBurst sets the burst size
+func (b *Builder) WithBurst(burst int64) *Builder {
+	if b.err != nil {
+		return b
+	}
+	b.config.DefaultBurst = burst
+	return b
+}
+
+// WithResolver sets a limit resolver for tier-based limits
+func (b *Builder) WithResolver(resolver LimitResolver) *Builder {
+	if b.err != nil {
+		return b
+	}
+	b.config.Resolver = resolver
+	return b
+}
+
+// WithTiers sets up tier-based limiting with the given configuration
+func (b *Builder) WithTiers(resolverConfig *ResolverConfig) *Builder {
+	if b.err != nil {
+		return b
+	}
+	resolver, err := NewLimitResolver(resolverConfig)
+	if err != nil {
+		b.err = WrapConfigError(err, "failed to create resolver")
+		return b
+	}
+	b.config.Resolver = resolver
+	return b
+}
+
+// WithDefaultTiers sets up tier-based limiting with default configuration
+func (b *Builder) WithDefaultTiers() *Builder {
+	return b.WithTiers(NewDefaultResolverConfig())
+}
+
+// WithStrictTiers sets up tier-based limiting with strict limits
+func (b *Builder) WithStrictTiers() *Builder {
+	return b.WithTiers(NewStrictResolverConfig())
+}
+
+// WithGenerousTiers sets up tier-based limiting with generous limits
+func (b *Builder) WithGenerousTiers() *Builder {
+	return b.WithTiers(NewGenerousResolverConfig())
+}
+
+// WithLogger sets a custom logger
+func (b *Builder) WithLogger(logger Logger) *Builder {
+	if b.err != nil {
+		return b
+	}
+	b.config.Logger = logger
+	return b
+}
+
+// WithMetrics enables metrics collection
+func (b *Builder) WithMetrics(enable bool) *Builder {
+	if b.err != nil {
+		return b
+	}
+	b.config.EnableMetrics = enable
+	return b
+}
+
+// Build creates the rate limiter
+func (b *Builder) Build() (RateLimiter, error) {
+	if b.err != nil {
+		return nil, b.err
+	}
+
+	// Set defaults if not configured
+	if b.config.Store == nil {
+		return nil, WrapConfigError(nil, "store is required - use WithStore() to set it")
+	}
+	if b.config.Algorithm == nil {
+		b.config.Algorithm = NewTokenBucketAlgorithm()
+	}
+
+	return NewRateLimiter(b.config)
+}
+
+// MustBuild creates the rate limiter or panics on error
+// Use only when you're certain the configuration is valid
+func (b *Builder) MustBuild() RateLimiter {
+	limiter, err := b.Build()
+	if err != nil {
+		panic(err)
+	}
+	return limiter
+}
+
+// ============================================================================
+// PRESET CONFIGURATIONS
+// ============================================================================
+
+// NewForAPI creates a rate limiter optimized for API gateway use
+// - Higher limits for throughput
+// - Token bucket for burst handling
+// Requires a store to be provided
+func NewForAPI(store Store) (RateLimiter, error) {
+	return NewBuilder().
+		WithStore(store).
+		WithTokenBucket().
+		WithLimit(10000, time.Hour).
+		WithBurst(1000).
+		Build()
+}
+
+// NewForWebApp creates a rate limiter optimized for web applications
+// - Moderate limits
+// - Sliding window for fairness
+// Requires a store to be provided
+func NewForWebApp(store Store) (RateLimiter, error) {
+	return NewBuilder().
+		WithStore(store).
+		WithSlidingWindow().
+		WithLimit(1000, time.Hour).
+		WithBurst(100).
+		Build()
+}
+
+// NewForMicroservice creates a rate limiter optimized for microservices
+// - Lower limits to protect services
+// - Token bucket for burst handling
+// Requires a store to be provided
+func NewForMicroservice(store Store) (RateLimiter, error) {
+	return NewBuilder().
+		WithStore(store).
+		WithTokenBucket().
+		WithLimit(500, time.Minute).
+		WithBurst(50).
+		Build()
+}
+
+// NewForPublicAPI creates a rate limiter for public-facing APIs
+// - Strict limits to prevent abuse
+// - Sliding window for fairness
+// - Multi-tier support
+// Requires a store to be provided
+func NewForPublicAPI(store Store) (RateLimiter, error) {
+	return NewBuilder().
+		WithStore(store).
+		WithSlidingWindow().
+		WithStrictTiers().
+		Build()
+}
+
+// NewForSaaS creates a rate limiter for SaaS applications
+// - Tier-based limits (free, premium, enterprise)
+// - Token bucket for user experience
+// Requires a store to be provided
+func NewForSaaS(store Store) (RateLimiter, error) {
+	return NewBuilder().
+		WithStore(store).
+		WithTokenBucket().
+		WithDefaultTiers().
+		Build()
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+// IsRateLimited checks if a result indicates rate limiting
+func IsRateLimited(result *Result) bool {
+	return result != nil && !result.Allowed
+}
+
+// GetRetryAfter returns the retry-after duration from a result
+func GetRetryAfter(result *Result) time.Duration {
+	if result == nil {
+		return 0
+	}
+	return result.RetryAfter
+}
+
+// GetUsagePercent returns the usage as a percentage (0-100)
+func GetUsagePercent(result *Result) float64 {
+	if result == nil || result.Limit == 0 {
+		return 0
+	}
+	return (float64(result.Used) / float64(result.Limit)) * 100
+}
+
+// IsNearLimit checks if usage is near the limit (>= threshold %)
+func IsNearLimit(result *Result, thresholdPercent float64) bool {
+	return GetUsagePercent(result) >= thresholdPercent
+}
+
+// ============================================================================
+// CONTEXT HELPERS
+// ============================================================================
+
+// NewScopedContext creates a context for a user with a specific scope
+// This is a helper that wraps NewSimpleContext with clearer naming
+func NewScopedContext(identity, scope, tier string, metadata map[string]interface{}) Identity {
+	return NewSimpleContext(identity, scope, tier, metadata)
+}
+
+// ============================================================================
+// BATCH OPERATIONS
+// ============================================================================
+
+// CheckMultiple checks rate limits for multiple identities at once
+// Returns a map of identity -> result
+func CheckMultiple(ctx context.Context, limiter RateLimiter, identities []string, scope, tier string) map[string]*Result {
+	results := make(map[string]*Result, len(identities))
+
+	for _, identity := range identities {
+		rlCtx := NewSimpleContext(identity, scope, tier, nil)
+		result, err := limiter.Allow(ctx, rlCtx)
+		if err != nil {
+			// Create a denied result on error
+			result = &Result{
+				Allowed: false,
+				Entity:  identity,
+			}
+		}
+		results[identity] = result
+	}
+
+	return results
+}
+
+// ResetMultiple resets rate limits for multiple identities
+func ResetMultiple(ctx context.Context, limiter RateLimiter, identities []string, scope, tier string) error {
+	for _, identity := range identities {
+		rlCtx := NewSimpleContext(identity, scope, tier, nil)
+		if err := limiter.Reset(ctx, rlCtx); err != nil {
+			return WrapConfigError(err, "failed to reset identity", "identity", identity)
+		}
+	}
+	return nil
+}
+
+// ============================================================================
+// ERROR HELPERS
+// ============================================================================
+
+// IsStorageError checks if an error is a storage-related error
+func IsStorageError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return err == ErrKeyNotFound || err == ErrConnectionFailed
 }

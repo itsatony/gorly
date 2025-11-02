@@ -409,36 +409,7 @@ go mod init test-install
 go get github.com/itsatony/gorly@${VERSION}
 ```
 
-For applications with binaries:
-```bash
-# 1. Build release binaries for multiple platforms
-PLATFORMS="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64"
-
-for platform in $PLATFORMS; do
-    GOOS=${platform%/*}
-    GOARCH=${platform#*/}
-    
-    output="gorly-${VERSION}-${GOOS}-${GOARCH}"
-    if [ "$GOOS" = "windows" ]; then
-        output="${output}.exe"
-    fi
-    
-    GOOS=$GOOS GOARCH=$GOARCH go build -o "dist/${output}" ./cmd/gorly
-    
-    # Create checksums
-    shasum -a 256 "dist/${output}" >> "dist/checksums-${VERSION}.txt"
-done
-
-# 2. Create release archives
-cd dist
-for file in gorly-${VERSION}-*; do
-    if [[ "$file" == *.exe ]]; then
-        zip "${file%.*}.zip" "$file"
-    else
-        tar -czf "${file}.tar.gz" "$file"
-    fi
-done
-```
+**Note**: Gorly is a library, not an application, so binary artifacts are not needed. The Go module proxy automatically handles distribution.
 
 ### Post-Release Activities
 
@@ -447,10 +418,7 @@ done
 # Using GitHub CLI
 gh release create ${VERSION} \
     --title "Release ${VERSION}" \
-    --notes-from-tag \
-    dist/gorly-${VERSION}-*.tar.gz \
-    dist/gorly-${VERSION}-*.zip \
-    dist/checksums-${VERSION}.txt
+    --notes-from-tag
 ```
 
 #### 2. Communication & Announcements
@@ -460,15 +428,8 @@ gh release create ${VERSION} \
 - [ ] Notify dependent projects (if breaking changes)
 - [ ] Post release notes to social media/blog
 
-#### 3. Docker Images (if applicable)
-```bash
-# Build and push Docker images
-docker build -t myorg/gorly:${VERSION} .
-docker build -t myorg/gorly:latest .
-
-docker push myorg/gorly:${VERSION}
-docker push myorg/gorly:latest
-```
+#### 3. Docker Images (not applicable for libraries)
+Docker images are not needed for Go libraries. Users import the library directly via `go get`.
 
 #### 4. Monitoring & Rollback Preparation
 ```bash
