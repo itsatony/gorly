@@ -48,3 +48,10 @@ go.work.sum
 /builder
 /main
 *.bak
+
+# Example binaries (go build creates binaries with directory name)
+examples/*/pattern-routing
+examples/*/basic
+examples/*/builder
+examples/*/api-gateway
+examples/*/main

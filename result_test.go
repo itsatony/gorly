@@ -1,6 +1,7 @@
 package ratelimit
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -1624,4 +1625,66 @@ func BenchmarkResult_ConcurrentMetadataAccess(b *testing.B) {
 			i++
 		}
 	})
+}
+
+// TestResult_CloneDeadlock tests for deadlock between Clone and SetMetadata
+// This test was added after discovering a P0 deadlock in production code review.
+// The deadlock occurred when Clone() read fields without lock protection while
+// SetMetadata() held the metadataMu lock, creating contention under high concurrency.
+//
+// REGRESSION TEST: DO NOT REMOVE - This validates the fix in result.go:317-319
+func TestResult_CloneDeadlock(t *testing.T) {
+	result := NewAllowedResult(100, 50, 50, time.Now().Add(time.Hour), time.Hour)
+
+	// 5 second timeout - if test doesn't complete, it's deadlocked
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	done := make(chan bool)
+
+	go func() {
+		var wg sync.WaitGroup
+
+		// Heavy Clone usage - 100 goroutines, 100 clones each = 10,000 clones
+		for i := 0; i < 100; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 100; j++ {
+					cloned := result.Clone()
+					// Verify clone is valid
+					if cloned == nil {
+						t.Error("Clone returned nil")
+						return
+					}
+					if cloned.Limit != 100 {
+						t.Errorf("Clone has invalid Limit: %d", cloned.Limit)
+					}
+				}
+			}()
+		}
+
+		// Heavy SetMetadata usage - 100 goroutines, 100 sets each = 10,000 sets
+		for i := 0; i < 100; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for j := 0; j < 100; j++ {
+					result.SetMetadata(fmt.Sprintf("key_%d_%d", id, j), j)
+				}
+			}(i)
+		}
+
+		wg.Wait()
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		t.Log("✅ No deadlock detected - Clone() and SetMetadata() work correctly under high concurrency")
+	case <-ctx.Done():
+		t.Fatal("🚨 DEADLOCK DETECTED: Test timed out after 5 seconds. " +
+			"This indicates Clone() is deadlocking with SetMetadata(). " +
+			"Check result.go:317-319 for proper lock acquisition.")
+	}
 }

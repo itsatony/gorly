@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/itsatony/gorly"
+	"github.com/itsatony/gorly/routing"
 	"github.com/itsatony/gorly/stores"
 )
 
@@ -338,6 +339,8 @@ func UserContextExtractor(contextKey string) HTTPContextExtractor {
 }
 
 // PathScopeContextExtractor creates a context extractor with dynamic scope based on URL path
+// This function supports exact and prefix matching only.
+// For advanced pattern matching (glob, regex), use RouteAwareContextExtractor instead.
 func PathScopeContextExtractor(pathMappings map[string]string, baseExtractor HTTPContextExtractor) HTTPContextExtractor {
 	return func(r *http.Request) (ratelimit.Identity, error) {
 		// Get base context
@@ -361,6 +364,55 @@ func PathScopeContextExtractor(pathMappings map[string]string, baseExtractor HTT
 					break
 				}
 			}
+		}
+
+		// Create new context with the determined scope
+		return ratelimit.NewSimpleContext(
+			baseCtx.Identity(),
+			scope,
+			baseCtx.Tier(),
+			baseCtx.Metadata(),
+		), nil
+	}
+}
+
+// RouteAwareContextExtractor creates a context extractor with advanced pattern-based scope resolution.
+// It uses a RouteResolver to support exact, prefix, glob, and regex pattern matching.
+//
+// Example:
+//
+//	resolver := routing.NewBuilder().
+//	    AddExact("/api/payment/process", "payment_critical", 100).
+//	    AddGlob("/api/payment/*", "payment", 50).
+//	    AddGlob("/api/admin/**", "admin", 80).
+//	    AddRegex("^/api/v[0-9]+/.*", "api_versioned", 30).
+//	    AddPrefix("/api/", "api_default", 10).
+//	    MustBuild()
+//
+//	extractor := RouteAwareContextExtractor(resolver, baseExtractor, "global")
+//	middleware := NewHTTPMiddleware(&HTTPMiddlewareConfig{
+//	    Limiter: limiter,
+//	    ContextExtractor: extractor,
+//	})
+func RouteAwareContextExtractor(resolver routing.RouteResolver, baseExtractor HTTPContextExtractor, defaultScope string) HTTPContextExtractor {
+	if defaultScope == "" {
+		defaultScope = ratelimit.ScopeGlobal
+	}
+
+	return func(r *http.Request) (ratelimit.Identity, error) {
+		// Get base context
+		baseCtx, err := baseExtractor(r)
+		if err != nil {
+			return nil, err
+		}
+
+		// Resolve scope from path using the route resolver
+		path := r.URL.Path
+		scope, matched := resolver.ResolveScope(path)
+
+		// Use default scope if no pattern matched
+		if !matched {
+			scope = defaultScope
 		}
 
 		// Create new context with the determined scope

@@ -11,10 +11,18 @@
 
 - **Production-Ready**: 744 tests passing, 74% coverage, zero race conditions, security-hardened
 - **Flexible**: IP, API key, user, tenant, or custom identity extraction
+- **Per-Endpoint Rate Limits**: Automatically apply different limits to different routes (payments, admin, search) without custom logic (v1.2.0+)
 - **Multi-Backend**: In-memory (dev) or Redis (production) with the same API
 - **Thread-Safe**: Race detector tested, production-proven concurrency guarantees
 - **Zero Surprises**: Explicit configuration, predictable behavior, comprehensive error handling
 - **Developer-Friendly**: Simple API for basic cases, powerful features for complex requirements
+
+## What's New in v1.2.0
+
+- **Pattern-Based Per-Endpoint Rate Limiting**: Apply different rate limits to different endpoints automatically - no more manual scope extraction for every route
+- **Prometheus Metrics for Routing**: Built-in observability for pattern matching performance and routing decisions
+- **Debug & Inspection Tools**: ExplainMatch(), Inspect(), and ValidateConfiguration() for troubleshooting routing issues
+- **Jump to [Use Case 9](#use-case-9-pattern-based-per-endpoint-rate-limiting-v120) for a complete example**
 
 ## Quick Start
 
@@ -385,6 +393,100 @@ mux.Handle("/search", mw.Middleware(http.HandlerFunc(searchHandler)))
 // Start server
 http.ListenAndServe(":8080", mux)
 ```
+
+### Use Case 9: Pattern-Based Per-Endpoint Rate Limiting (v1.2.0+)
+
+**Scenario**: Different rate limits for different API endpoints using intelligent pattern matching
+
+Pattern-based routing allows you to map request paths to specific rate limit scopes using exact matches, prefixes, globs, or regex patterns. This eliminates manual scope extraction logic and provides fine-grained control over endpoint-specific limits.
+
+```go
+import (
+    ratelimit "github.com/itsatony/gorly"
+    "github.com/itsatony/gorly/middleware"
+    "github.com/itsatony/gorly/routing"
+    "github.com/itsatony/gorly/stores"
+)
+
+// 1. Configure pattern-based route resolver
+resolver := routing.NewBuilder().
+    // Exact match - highest priority for critical endpoints
+    AddExact("/api/payment/process", "payment_critical", 100).
+
+    // Glob patterns - match path segments
+    AddGlob("/api/payment/*", "payment", 50).           // Single segment
+    AddGlob("/api/admin/**", "admin", 80).              // Multiple segments
+
+    // Regex patterns - flexible matching (e.g., API versioning)
+    AddRegex(`^/api/v[0-9]+/.*`, "api_versioned", 30).
+
+    // Prefix matching - catch-all for API routes
+    AddPrefix("/api/", "api_default", 10).
+
+    MustBuild()
+
+// 2. Create limiter with per-scope configurations
+store, _ := stores.NewMemoryStore(nil)
+config := ratelimit.DefaultConfig()
+config.Store = store
+
+// Configure different limits for each scope
+config.ScopeLimits = map[string]ratelimit.RateLimit{
+    "payment_critical": {RateString: "100/minute", BurstSize: 10},
+    "payment":          {RateString: "500/hour", BurstSize: 50},
+    "admin":            {RateString: "1000/hour", BurstSize: 100},
+    "api_versioned":    {RateString: "5000/hour", BurstSize: 200},
+    "api_default":      {RateString: "10000/hour", BurstSize: 500},
+}
+
+limiter, _ := ratelimit.NewRateLimiter(config)
+defer limiter.Close()
+
+// 3. Create route-aware context extractor
+extractor := middleware.RouteAwareContextExtractor(
+    resolver,
+    func(r *http.Request) (ratelimit.Identity, error) {
+        // Extract identity (IP, API key, user, etc.)
+        apiKey := r.Header.Get("X-API-Key")
+        tier := lookupUserTier(apiKey)
+        return ratelimit.NewAPIKeyContext(apiKey, tier), nil
+    },
+    "global", // default scope if no pattern matches
+)
+
+// 4. Use in HTTP middleware
+mw, _ := middleware.NewHTTPMiddleware(&middleware.HTTPMiddlewareConfig{
+    Limiter:          limiter,
+    ContextExtractor: extractor,
+    AddHeaders:       true,
+})
+
+// 5. Apply to your routes
+mux := http.NewServeMux()
+mux.Handle("/", mw.Middleware(yourHandler))
+
+http.ListenAndServe(":8080", mux)
+```
+
+**How Pattern Resolution Works:**
+
+1. Incoming request: `POST /api/payment/process`
+2. Pattern matching (priority order):
+   - ✅ Exact match `/api/payment/process` → **"payment_critical" scope** (100 priority)
+   - Glob `/api/payment/*` → matches but lower priority (50)
+   - Prefix `/api/` → matches but lower priority (10)
+3. Rate limit applied: 100 requests/minute with 10 burst
+4. Request proceeds if within limit
+
+**Key Benefits:**
+
+- **Declarative Configuration**: Define patterns once, no per-route logic
+- **Priority-Based**: Higher priority patterns override lower ones
+- **Performance**: Exact matches are O(1), glob/regex optimized with caching
+- **Security**: Built-in ReDoS protection with configurable timeouts
+- **Observability**: Optional Prometheus metrics for pattern matching
+
+**Complete Example:** See [`examples/pattern-routing/`](examples/pattern-routing/) for a full working HTTP server with metrics, debug tools, and multiple pattern types.
 
 ## Configuration Patterns
 
@@ -984,11 +1086,13 @@ See the [`examples/`](examples/) directory for complete working examples:
 - **[`builder/`](examples/builder/)** - Builder pattern and configurations
 - **[`middleware/`](examples/middleware/)** - HTTP middleware integration
 - **[`tiers/`](examples/tiers/)** - Multi-tier SaaS rate limiting
+- **[`pattern-routing/`](examples/pattern-routing/)** - ⭐ **NEW in v1.2.0**: Advanced pattern-based per-endpoint rate limiting with Prometheus metrics and debug tools
 
 Run examples:
 ```bash
 cd examples/basic && go run main.go
 cd examples/middleware && go run main.go
+cd examples/pattern-routing && go run main.go  # New: Pattern-based routing
 ```
 
 ## Troubleshooting

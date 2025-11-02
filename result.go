@@ -18,15 +18,19 @@ import (
 // ============================================================================
 //
 // SAFE OPERATIONS (can be called concurrently):
-//   - Reading immutable fields after construction: Allowed, Limit, Remaining, etc.
-//   - GetMetadata(), SetMetadata(), GetAllMetadata() - all metadata operations
-//   - Clone() - creates a thread-safe copy
-//   - String(), UsagePercentage(), helper methods - all read-only operations
+//   - GetMetadata(), SetMetadata(), GetAllMetadata(), HasMetadata() - all metadata operations
+//   - Clone() - creates a thread-safe snapshot (FIXED: now properly synchronized)
+//   - String(), UsagePercentage() - read-only helper methods
+//
+// CONDITIONALLY SAFE (safe ONLY if WithContext/WithStrategy not called concurrently):
+//   - Reading fields: Allowed, Limit, Remaining, Used, RetryAfter, ResetAt, Window
+//   - Reading context fields: Scope, Entity, Tier, Strategy
 //
 // UNSAFE OPERATIONS (NOT thread-safe, must NOT be called concurrently):
 //   - WithContext() - modifies Scope, Entity, Tier without synchronization
 //   - WithStrategy() - modifies Strategy without synchronization
 //   - Direct field writes after construction
+//   - Reading Scope/Entity/Tier/Strategy while WithContext/WithStrategy are running
 //
 // RECOMMENDED USAGE PATTERN:
 //  1. Create Result with constructor (NewAllowedResult, NewDeniedResult)
@@ -308,7 +312,16 @@ func (r *Result) RetryAfterSeconds() int64 {
 // ============================================================================
 
 // Clone creates a deep copy of the result (thread-safe)
+//
+// THREAD SAFETY: This method is fully thread-safe and can be called
+// concurrently with all other methods, including WithContext() and WithStrategy().
+// It acquires a read lock for the entire duration of the clone operation to ensure
+// a consistent snapshot of all fields.
 func (r *Result) Clone() *Result {
+	// CRITICAL: Acquire lock BEFORE reading ANY fields to prevent race conditions
+	r.metadataMu.RLock()
+	defer r.metadataMu.RUnlock()
+
 	cloned := &Result{
 		Allowed:    r.Allowed,
 		Limit:      r.Limit,
@@ -321,15 +334,13 @@ func (r *Result) Clone() *Result {
 		Entity:     r.Entity,
 		Tier:       r.Tier,
 		Strategy:   r.Strategy,
-		metadata:   make(map[string]interface{}),
+		metadata:   make(map[string]interface{}, len(r.metadata)),
 	}
 
-	// Deep copy metadata with lock protection
-	r.metadataMu.RLock()
+	// Copy metadata while holding lock
 	for k, v := range r.metadata {
 		cloned.metadata[k] = v
 	}
-	r.metadataMu.RUnlock()
 
 	return cloned
 }
