@@ -10,8 +10,9 @@ import (
 	"testing"
 	"time"
 
-	ratelimit "github.com/itsatony/gorly"
 	"github.com/redis/go-redis/v9"
+
+	ratelimit "github.com/itsatony/gorly"
 )
 
 // Minimal assertion helpers (the package's tests use only the stdlib).
@@ -66,7 +67,7 @@ func requireSecureRedisEnv(t *testing.T) secureRedisEnv {
 		certPath: os.Getenv(envRedisTLSCert),
 	}
 	if e.aclAddr == "" || e.tlsAddr == "" || e.user == "" || e.password == "" || e.certPath == "" {
-		t.Skip("ACL/TLS Redis not configured; run scripts/setup-redis-secure.sh and export its env")
+		skipOrFailInCI(t, "ACL/TLS Redis not configured; run scripts/setup-redis-secure.sh and export its env")
 	}
 	return e
 }
@@ -80,32 +81,38 @@ func secureTestConfig(addr string) *RedisStoreConfig {
 	return cfg
 }
 
-// pinnedTLSConfig verifies the server's chain against the pinned certificate
-// and deliberately skips the hostname check — the only way to trust a CN-only,
-// SAN-less self-signed cert (crypto/tls ignores CN). InsecureSkipVerify turns
-// off the default verification; VerifyConnection replaces it, so the chain IS
-// still verified.
+// skipOrFailInCI skips a live test locally but FAILS it in CI (CI=true), so a
+// CI whose Redis fixtures went missing cannot pass by skipping the very tests
+// that cover ACL and TLS.
+func skipOrFailInCI(t *testing.T, reason string) {
+	t.Helper()
+	if os.Getenv("CI") == "true" {
+		t.Fatalf("CI=true but %s", reason)
+	}
+	t.Skip(reason)
+}
+
+// requirePlainRedis returns a client on the plaintext test Redis (DB 15), or
+// skips (fails in CI) when it is not reachable.
+func requirePlainRedis(t *testing.T) *redis.Client {
+	t.Helper()
+	client := redis.NewClient(&redis.Options{Addr: "localhost:6379", DB: 15, DialTimeout: time.Second})
+	t.Cleanup(func() { _ = client.Close() })
+	if err := client.Ping(context.Background()).Err(); err != nil {
+		skipOrFailInCI(t, "Redis not available on localhost:6379")
+	}
+	return client
+}
+
+// pinnedTLSConfig pins the test server's leaf with the shipped helper — the
+// same call a consumer makes for a CN-only, SAN-less managed-Redis cert.
 func pinnedTLSConfig(t *testing.T, certPath string) *tls.Config {
 	t.Helper()
-	pem, err := os.ReadFile(certPath)
+	pemBytes, err := os.ReadFile(certPath)
 	aclNoErr(t, err)
-	pool := x509.NewCertPool()
-	aclTrue(t, pool.AppendCertsFromPEM(pem), "pinned cert is not PEM")
-	return &tls.Config{
-		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: true, //nolint:gosec // replaced by VerifyConnection (pinning)
-		VerifyConnection: func(cs tls.ConnectionState) error {
-			if len(cs.PeerCertificates) == 0 {
-				return errors.New("no peer certificate")
-			}
-			inter := x509.NewCertPool()
-			for _, c := range cs.PeerCertificates[1:] {
-				inter.AddCert(c)
-			}
-			_, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{Roots: pool, Intermediates: inter})
-			return err
-		},
-	}
+	tc, err := PinnedLeafTLSConfig(pemBytes)
+	aclNoErr(t, err)
+	return tc
 }
 
 func exerciseStore(t *testing.T, store *RedisStore) {
@@ -180,16 +187,14 @@ func TestRedisStore_TLS(t *testing.T) {
 		cfg := secureTestConfig(e.tlsAddr)
 		cfg.Username = e.user
 		cfg.Password = e.password
-		tc := pinnedTLSConfig(t, e.certPath)
-		wrongPool := x509.NewCertPool() // pins nothing
-		tc.VerifyConnection = func(cs tls.ConnectionState) error {
-			_, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{Roots: wrongPool})
-			return err
-		}
+		// A different certificate with the SAME shape (CN-only, SAN-less).
+		otherPEM, _ := selfSignedPEM(t, "fd00::6379", time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+		tc, err := PinnedLeafTLSConfig(otherPEM)
+		aclNoErr(t, err)
 		cfg.TLSConfig = tc
-		_, err := NewRedisStore(cfg)
+		_, err = NewRedisStore(cfg)
 		aclErr(t, err)
-		aclTrue(t, strings.Contains(err.Error(), "x509"), "want an x509 verification failure, got %v", err)
+		aclTrue(t, strings.Contains(err.Error(), "not the pinned leaf"), "want a pin mismatch, got %v", err)
 	})
 
 	t.Run("the caller's tls.Config is cloned, not retained", func(t *testing.T) {
@@ -284,11 +289,7 @@ func TestNewRedisStoreFromClient_DoesNotMutateCallerConfig(t *testing.T) {
 }
 
 func TestNewRedisStoreFromClient_PlainRedis(t *testing.T) {
-	client := redis.NewClient(&redis.Options{Addr: "localhost:6379", DB: 15, DialTimeout: time.Second})
-	defer func() { _ = client.Close() }()
-	if err := client.Ping(context.Background()).Err(); err != nil {
-		t.Skip("Redis not available on localhost:6379")
-	}
+	client := requirePlainRedis(t)
 	store, err := NewRedisStoreFromClient(client, nil)
 	aclNoErr(t, err)
 	exerciseStore(t, store)
@@ -301,7 +302,7 @@ func TestNewRedisStoreFromClient_PlainRedis(t *testing.T) {
 
 func TestRedisStoreConfig_RefusesUnverifiedTLS(t *testing.T) {
 	cfg := DefaultRedisStoreConfig()
-	cfg.TLSConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // the case under test
+	cfg.TLSConfig = &tls.Config{InsecureSkipVerify: true}
 	err := cfg.Validate()
 	aclErr(t, err)
 	aclTrue(t, ratelimit.IsConfigError(err), "want config error, got %v", err)
@@ -314,11 +315,7 @@ func TestRedisStoreConfig_RefusesUnverifiedTLS(t *testing.T) {
 }
 
 func TestNewRedisStoreFromClient_DefaultsZeroRetryBackoff(t *testing.T) {
-	client := redis.NewClient(&redis.Options{Addr: "localhost:6379", DB: 15, DialTimeout: time.Second})
-	defer func() { _ = client.Close() }()
-	if err := client.Ping(context.Background()).Err(); err != nil {
-		t.Skip("Redis not available on localhost:6379")
-	}
+	client := requirePlainRedis(t)
 	store, err := NewRedisStoreFromClient(client, &RedisStoreConfig{RetryMaxAttempts: 2})
 	aclNoErr(t, err)
 	def := DefaultRedisStoreConfig()

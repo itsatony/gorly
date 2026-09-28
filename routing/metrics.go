@@ -154,7 +154,7 @@ func (m *PrometheusMetrics) RecordMatch(matchType MatchType, pattern string, dur
 
 	// Update in-memory counters for GetStats()
 	m.totalResolves.Add(1)
-	m.totalDuration.Add(uint64(duration.Nanoseconds()))
+	m.totalDuration.Add(uint64(duration.Nanoseconds())) //nolint:gosec // G115: a measured duration is never negative
 
 	switch matchType {
 	case MatchExact:
@@ -176,7 +176,7 @@ func (m *PrometheusMetrics) RecordNoMatch(duration time.Duration) {
 	// Update in-memory counters
 	m.totalResolves.Add(1)
 	m.noMatches.Add(1)
-	m.totalDuration.Add(uint64(duration.Nanoseconds()))
+	m.totalDuration.Add(uint64(duration.Nanoseconds())) //nolint:gosec // G115: a measured duration is never negative
 }
 
 // GetStats implements Metrics.GetStats
@@ -186,7 +186,7 @@ func (m *PrometheusMetrics) GetStats() MetricsSnapshot {
 
 	avgDuration := time.Duration(0)
 	if totalResolves > 0 {
-		avgDuration = time.Duration(totalDurationNs / totalResolves)
+		avgDuration = time.Duration(totalDurationNs / totalResolves) //nolint:gosec // G115: an average duration fits int64
 	}
 
 	return MetricsSnapshot{

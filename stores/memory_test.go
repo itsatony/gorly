@@ -24,7 +24,7 @@ func TestNewMemoryStore(t *testing.T) {
 	defer store.Close()
 
 	stats := store.Stats()
-	if stats.ShardCount != int(ratelimit.DefaultShardCount) {
+	if stats.ShardCount != ratelimit.DefaultShardCount {
 		t.Errorf("expected %d shards, got %d", ratelimit.DefaultShardCount, stats.ShardCount)
 	}
 	if stats.TotalKeys != 0 {

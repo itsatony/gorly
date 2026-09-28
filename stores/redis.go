@@ -7,9 +7,10 @@ import (
 	"sync"
 	"time"
 
-	ratelimit "github.com/itsatony/gorly"
 	"github.com/redis/go-redis/v9"
 	nuts "github.com/vaudience/go-nuts"
+
+	ratelimit "github.com/itsatony/gorly"
 )
 
 // ============================================================================
@@ -54,11 +55,18 @@ type RedisStoreConfig struct {
 
 	// TLSConfig enables TLS when non-nil. It is cloned at construction, so
 	// later mutation by the caller has no effect on the store. When ServerName
-	// is empty, crypto/tls derives it from Address. To pin a certificate that
-	// carries no usable hostname (e.g. a CN-only, SAN-less self-signed cert),
-	// set InsecureSkipVerify together with a VerifyConnection that checks the
-	// chain against the pinned CA — InsecureSkipVerify alone verifies nothing.
-	// nil (the default) keeps a plaintext connection, as before.
+	// is empty, crypto/tls derives it from Address. nil (the default) keeps a
+	// plaintext connection, as before. MinVersion below TLS 1.2 is refused.
+	//
+	// To trust a certificate that carries no usable hostname (e.g. a CN-only,
+	// SAN-less self-signed cert, as Scaleway's managed Redis presents), use
+	// PinnedLeafTLSConfig: it pins the exact LEAF certificate.
+	//
+	// ⛔ Do NOT hand-roll "InsecureSkipVerify + verify the chain against a CA
+	// pool" unless the pool holds only that one leaf: with the hostname check
+	// off, a chain check against a CA that also signs OTHER tenants' servers
+	// (a provider-wide CA) accepts every one of their certificates too.
+	// InsecureSkipVerify with no verifier at all is refused (it verifies nothing).
 	TLSConfig *tls.Config
 
 	// Database to use (0-15)
@@ -98,11 +106,16 @@ type RedisStoreConfig struct {
 	// EnableMetrics enables Redis metrics collection
 	EnableMetrics bool
 
-	// KeyPrefix is an optional prefix for all Redis keys
+	// KeyPrefix is the prefix for all Redis keys (default "gorly:"). For
+	// NewRedisStoreFromClient an empty KeyPrefix is replaced by the default,
+	// because a caller-owned client usually shares its database with the rest
+	// of the service and unprefixed keys would collide with it.
 	KeyPrefix string
 
-	// RetryMaxAttempts is the maximum number of retry attempts for transient failures
-	// Set to 0 to disable application-level retries (only use go-redis built-in retries)
+	// RetryMaxAttempts is the maximum number of application-level retry
+	// attempts for transient failures. 0 disables them (only go-redis's own
+	// MaxRetries apply) — note that a partial config literal therefore gets NO
+	// application-level retries unless it sets this; negative is refused.
 	RetryMaxAttempts int
 
 	// RetryInitialBackoff is the initial backoff duration before first retry
@@ -162,18 +175,30 @@ func (c *RedisStoreConfig) Validate() error {
 		return ratelimit.WrapConfigError(nil, "Max retries cannot be negative",
 			"max_retries", c.MaxRetries)
 	}
-	if c.DialTimeout < time.Second {
+	if c.DialTimeout < minDialTimeout {
 		return ratelimit.WrapConfigError(nil, "Dial timeout must be at least 1 second",
 			"dial_timeout", c.DialTimeout)
 	}
 	return validateTLSConfig(c.TLSConfig)
 }
 
+// newGoRedisClient builds the client NewRedisStore owns (a seam for tests that
+// must observe that a failed construction closes it).
+var newGoRedisClient = redis.NewClient
+
+// minDialTimeout is the least DialTimeout (and, for NewRedisStoreFromClient,
+// startup-ping timeout) a config may set.
+const minDialTimeout = time.Second
+
 // validateTLSConfig refuses a TLS config that would verify nothing:
 // InsecureSkipVerify with neither VerifyConnection nor VerifyPeerCertificate
 // accepts ANY certificate, i.e. TLS without authentication. Pinning (skip the
 // hostname check, verify the chain yourself) must say so with a verifier.
 func validateTLSConfig(tc *tls.Config) error {
+	if tc != nil && tc.MinVersion != 0 && tc.MinVersion < tls.VersionTLS12 {
+		return ratelimit.WrapConfigError(nil, "TLS MinVersion below TLS 1.2 is not allowed",
+			"tls_min_version", tc.MinVersion)
+	}
 	if tc != nil && tc.InsecureSkipVerify && tc.VerifyConnection == nil && tc.VerifyPeerCertificate == nil {
 		return ratelimit.WrapConfigError(nil,
 			"TLS InsecureSkipVerify requires VerifyConnection or VerifyPeerCertificate (pin the certificate)",
@@ -203,7 +228,7 @@ func NewRedisStore(config *RedisStoreConfig) (*RedisStore, error) {
 	}
 
 	// Create Redis client with connection pooling
-	client := redis.NewClient(&redis.Options{
+	client := newGoRedisClient(&redis.Options{
 		Addr:         config.Address,
 		Username:     config.Username,
 		Password:     config.Password,
@@ -234,6 +259,12 @@ func NewRedisStore(config *RedisStoreConfig) (*RedisStore, error) {
 		// The store built this client; do not leak its pool on a failed boot.
 		_ = client.Close()
 		return nil, err
+	}
+
+	if config.Password != "" && tlsConfig == nil {
+		rs.logger.Warn("redis store authenticates over PLAINTEXT: the password crosses the network unencrypted; set TLSConfig",
+			"id", rs.id,
+			"address", config.Address)
 	}
 
 	rs.logger.Info("redis store created",
@@ -277,9 +308,21 @@ func NewRedisStoreFromClient(client redis.UniversalClient, config *RedisStoreCon
 	if config.Logger == nil {
 		config.Logger = ratelimit.NewNopLogger()
 	}
-	if config.DialTimeout <= 0 {
+	if config.DialTimeout == 0 {
 		config.DialTimeout = DefaultRedisStoreConfig().DialTimeout
 	}
+	if config.DialTimeout < minDialTimeout {
+		return nil, ratelimit.WrapConfigError(nil, "Dial timeout must be at least 1 second",
+			"dial_timeout", config.DialTimeout)
+	}
+	if config.KeyPrefix == "" {
+		// A caller-owned client usually shares its DB with the service:
+		// never write unprefixed keys into it.
+		config.KeyPrefix = DefaultRedisStoreConfig().KeyPrefix
+	}
+	// The default config's Address is not a caller statement; anything else is.
+	ignoredConnFields := (config.Address != "" && config.Address != DefaultRedisStoreConfig().Address) ||
+		config.Username != "" || config.Password != "" || config.TLSConfig != nil
 	if config.RetryMaxAttempts < 0 {
 		return nil, ratelimit.WrapConfigError(nil, "Retry max attempts cannot be negative",
 			"retry_max_attempts", config.RetryMaxAttempts)
@@ -311,6 +354,11 @@ func NewRedisStoreFromClient(client redis.UniversalClient, config *RedisStoreCon
 		id:         nuts.NID(ratelimit.IDPrefixRateLimiter, 16),
 	}
 
+	if ignoredConnFields {
+		rs.logger.Warn("redis store: Address/Username/Password/TLSConfig are IGNORED with a caller-owned client; configure them on the client",
+			"id", rs.id)
+	}
+
 	if err := rs.ping(config.DialTimeout); err != nil {
 		return nil, err
 	}
@@ -325,7 +373,8 @@ func NewRedisStoreFromClient(client redis.UniversalClient, config *RedisStoreCon
 }
 
 // describeClient reports the address and database of a client for Stats and
-// logs. Only *redis.Client exposes both; other UniversalClients report "" / 0.
+// logs. Only *redis.Client exposes both; other UniversalClients (Cluster,
+// Failover/Sentinel, Ring) report "" / 0.
 func describeClient(client redis.UniversalClient) (string, int) {
 	if c, ok := client.(*redis.Client); ok {
 		opts := c.Options()
@@ -719,7 +768,7 @@ func (rs *RedisStore) retryableOperation(ctx context.Context, operation string, 
 		// Sleep with exponential backoff
 		select {
 		case <-ctx.Done():
-			// Context cancelled, return context error
+			// Context canceled, return context error
 			return ctx.Err()
 		case <-time.After(backoff):
 			// Continue to next retry
@@ -931,7 +980,7 @@ func (rs *RedisStore) GetMulti(ctx context.Context, keys []string) (map[string][
 	result := make(map[string][]byte)
 	for i, cmd := range cmds {
 		if data, err := cmd.Bytes(); err == nil {
-			result[keys[i]] = data
+			result[keys[i]] = data //nolint:gosec // G602: cmds has exactly one entry per key
 		}
 	}
 
@@ -1110,10 +1159,20 @@ func (rs *RedisStore) Scan(ctx context.Context, pattern string, count int64) ([]
 	return keys, nil
 }
 
-// FlushDB clears all keys in the current database (USE WITH CAUTION)
+// FlushDB clears ALL keys in the current database, not just this store's
+// prefix (USE WITH CAUTION). It is only allowed on a client the store owns
+// (NewRedisStore): a caller-owned client (NewRedisStoreFromClient) usually
+// shares its database with the rest of the service, so FlushDB is refused
+// there — delete your own keys instead. ⚠ With a cluster client FLUSHDB
+// reaches only the node the command lands on.
 func (rs *RedisStore) FlushDB(ctx context.Context) error {
 	if err := rs.checkClosed(); err != nil {
 		return err
+	}
+	if !rs.ownsClient {
+		return ratelimit.WrapConfigError(nil,
+			"FlushDB is not supported on a caller-owned client (it would wipe the whole shared database)",
+			"owns_client", false)
 	}
 
 	err := rs.client.FlushDB(ctx).Err()

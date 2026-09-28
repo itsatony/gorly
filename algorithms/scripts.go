@@ -30,6 +30,8 @@ package algorithms
 // ARGV[5] = window expiration in seconds (for key TTL)
 //
 // Returns: {allowed (1/0), remaining, tokens_before, tokens_after, reset_timestamp}
+//
+//nolint:gosec // G101: a Lua script, not a credential
 const TokenBucketScript = `
 -- Parse arguments
 local key = KEYS[1]

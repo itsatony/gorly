@@ -12,7 +12,14 @@
 #   gorly-redis-tls    localhost:16381  TLS only,  ACL user only
 #
 # Prints the env exports the tests read. Stop with scripts/cleanup-redis-secure.sh.
+#
+# Env:  GORLY_CONTAINER_RUNTIME  podman (default) or docker (CI)
+#       GORLY_SKIP_PLAIN=1       do not start gorly-redis-plain (CI provides a
+#                                Redis service on 6379 already)
 set -euo pipefail
+
+RT="${GORLY_CONTAINER_RUNTIME:-podman}"
+SKIP_PLAIN="${GORLY_SKIP_PLAIN:-0}"
 
 IMAGE="${GORLY_REDIS_IMAGE:-docker.io/library/redis:7-alpine}"
 ACL_USER="gorlytest"
@@ -27,23 +34,25 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
 chmod 644 "$CERT_DIR/server.key" "$CERT_DIR/server.crt"
 
 for c in gorly-redis-plain gorly-redis-acl gorly-redis-tls; do
-  podman rm -f "$c" >/dev/null 2>&1 || true
+  "$RT" rm -f "$c" >/dev/null 2>&1 || true
 done
 
 ACL_ARGS=(--user default off --user "$ACL_USER" on ">$ACL_PASS" "~*" "&*" "+@all")
 
-podman run -d --name gorly-redis-plain -p 6379:6379 "$IMAGE" >/dev/null
-podman run -d --name gorly-redis-acl -p 16380:6379 "$IMAGE" \
+if [ "$SKIP_PLAIN" != "1" ]; then
+  "$RT" run -d --name gorly-redis-plain -p 6379:6379 "$IMAGE" >/dev/null
+fi
+"$RT" run -d --name gorly-redis-acl -p 16380:6379 "$IMAGE" \
   redis-server "${ACL_ARGS[@]}" >/dev/null
-podman run -d --name gorly-redis-tls -p 16381:6379 \
+"$RT" run -d --name gorly-redis-tls -p 16381:6379 \
   -v "$CERT_DIR:/tls:ro,Z" "$IMAGE" \
   redis-server --port 0 --tls-port 6379 \
   --tls-cert-file /tls/server.crt --tls-key-file /tls/server.key \
   --tls-auth-clients no "${ACL_ARGS[@]}" >/dev/null
 
 for _ in $(seq 1 30); do
-  if podman exec gorly-redis-plain redis-cli ping >/dev/null 2>&1 &&
-     podman exec gorly-redis-acl redis-cli --user "$ACL_USER" --pass "$ACL_PASS" ping >/dev/null 2>&1; then
+  if { [ "$SKIP_PLAIN" = "1" ] || "$RT" exec gorly-redis-plain redis-cli ping >/dev/null 2>&1; } &&
+     "$RT" exec gorly-redis-acl redis-cli --user "$ACL_USER" --pass "$ACL_PASS" ping >/dev/null 2>&1; then
     break
   fi
   sleep 1

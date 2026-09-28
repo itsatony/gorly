@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-09-28
+
+Review follow-up to 1.3.0 (gorly#1). No API removal; two refusals are new (see ⚠).
+
+### Security
+- **`stores.PinnedLeafTLSConfig(leafPEM)`** — the supported way to trust a CN-only,
+  SAN-less, self-signed server certificate (Scaleway managed Redis): TLS 1.2+,
+  the server's leaf must equal a pinned certificate byte-for-byte (SHA-256 of the
+  DER; several PEMs allowed for rotation), validity period enforced. The 1.3.0 docs
+  suggested `InsecureSkipVerify` + a chain check against a CA pool, which with the
+  hostname check off accepts **every** certificate that CA signed — for a
+  provider-wide CA, other tenants' servers too. Docs and the test helper now use
+  the leaf pin; a test demonstrates the shared-CA hole.
+- `TLSConfig.MinVersion` below TLS 1.2 is refused (`Validate`).
+- A WARN is logged once at construction when a password is sent over plaintext.
+
+### Fixed
+- ⚠ **`FlushDB` is refused on a caller-owned client** (`NewRedisStoreFromClient`).
+  It is a raw `FLUSHDB` that ignores `KeyPrefix`; on a client that shares its
+  database with the service it wiped the service's data. Owned clients unchanged.
+- **`NewRedisStoreFromClient` with a partial config literal** got `KeyPrefix ""`
+  (a nil config got `gorly:`): an empty prefix now becomes `gorly:`, so a shared
+  database never receives unprefixed keys. ⚠ A caller that relied on an empty
+  prefix with a caller-owned client sees its counters start fresh once (limits
+  reset for one window). `RetryMaxAttempts` 0 = no application-level retries is
+  now documented.
+- ⚠ `NewRedisStoreFromClient` refuses a `DialTimeout` below 1s, as `Validate` does
+  for `NewRedisStore` (0 still means the default).
+- A WARN when `Address`/`Username`/`Password`/`TLSConfig` are set alongside a
+  caller-owned client (they are ignored).
+
+### CI / tooling
+- `.golangci.yml` migrated to the v2 format (golangci-lint v2 could not load the
+  v1 file, so lint had silently stopped running); the codebase is lint-clean.
+- CI starts the ACL-only and TLS-only Redis fixtures (`scripts/setup-redis-secure.sh`,
+  now docker-capable), and the live ACL/TLS tests **fail instead of skipping when
+  `CI=true`**. The CI Go matrix targets 1.24/1.25 (go.mod requires 1.24.6; the old
+  1.21–1.23 matrix could never pass) and the gosec install path is fixed.
+- New tests: an owned client is closed by `Close`; `NewRedisStore` closes the
+  client it built when the startup ping fails; the refusals above.
+
 ## [1.3.0] - 2026-09-28
 
 ### Added - Managed Redis: ACL user, TLS, caller-owned client (gorly#1)
