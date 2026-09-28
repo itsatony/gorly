@@ -251,7 +251,7 @@ func (tb *TokenBucketAlgorithm) allowNonAtomic(ctx context.Context, store Store,
 
 	// Check if we have enough tokens
 	allowed := state.Tokens >= float64(n)
-	remaining := int64(math.Floor(state.Tokens))
+	var remaining int64
 
 	var retryAfter time.Duration
 	var resetTime time.Time

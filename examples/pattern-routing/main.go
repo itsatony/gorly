@@ -14,11 +14,12 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/itsatony/gorly"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	ratelimit "github.com/itsatony/gorly"
 	"github.com/itsatony/gorly/middleware"
 	"github.com/itsatony/gorly/routing"
 	"github.com/itsatony/gorly/stores"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {

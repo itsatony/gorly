@@ -628,11 +628,21 @@ cfg.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}
 store, err := stores.NewRedisStore(cfg)
 ```
 
-⚠ A self-signed, CN-only certificate without a SAN cannot pass Go's hostname
-check. Pin it instead: `InsecureSkipVerify: true` **together with** a
-`VerifyConnection` that verifies the peer chain against the pinned PEM
-(`x509.Certificate.Verify` with `Roots` and no `DNSName`) — `InsecureSkipVerify`
-alone verifies nothing. See `pinnedTLSConfig` in `stores/redis_acl_tls_test.go`.
+⚠ A self-signed, CN-only certificate without a SAN (e.g. Scaleway managed Redis)
+cannot pass Go's hostname check. **Pin the leaf** with the shipped helper (v1.3.1+):
+
+```go
+leafPEM, _ := os.ReadFile("/etc/redis/server.crt") // the server's own certificate
+tc, err := stores.PinnedLeafTLSConfig(leafPEM)     // TLS 1.2+, exact SHA-256 leaf match, validity checked
+cfg.TLSConfig = tc                                 // or redis.Options{TLSConfig: tc}
+```
+
+⛔ Do **not** hand-roll `InsecureSkipVerify` + "verify the chain against a CA
+pool": with the hostname check off, that accepts **every** certificate the CA
+signed — with a provider-wide CA, other tenants' servers included. It is only
+equivalent to a pin when the pool holds nothing but that one self-signed leaf.
+`PinnedLeafTLSConfig` accepts several PEM certificates (for rotation).
+`InsecureSkipVerify` with no verifier, and `MinVersion` below TLS 1.2, are refused.
 
 #### Reusing your own client (recommended when you already have one)
 
@@ -644,8 +654,13 @@ defer store.Close()   // marks the store closed; never closes client
 ```
 
 Any `redis.UniversalClient` is accepted. Only the store-level config fields apply
-(`KeyPrefix`, `Logger`, `Retry*`, `DialTimeout` as the startup-ping timeout);
-connection fields belong to the client and are ignored. One client factory means
+(`KeyPrefix`, `Logger`, `Retry*`, `DialTimeout` as the startup-ping timeout, ≥ 1s);
+connection fields belong to the client and are ignored (a WARN is logged if you set
+them). An empty `KeyPrefix` becomes `gorly:` — a shared client usually shares its
+database with the rest of your service. `RetryMaxAttempts` 0 means no
+application-level retries. `FlushDB` is refused on a caller-owned client (it would
+wipe the whole shared database). ⚠ With a `ClusterClient`, `Scan`/`FlushDB` reach
+one node and multi-key scripts need their keys in one hash slot. One client factory means
 the limiter can never open a weaker connection than the rest of the service.
 
 **Pros**:

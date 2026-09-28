@@ -94,7 +94,7 @@ func (sw *SlidingWindowAlgorithm) Allow(ctx context.Context, store Store, key st
 func (sw *SlidingWindowAlgorithm) allowAtomic(ctx context.Context, store Store, key string, limit int64, window time.Duration, n int64) (*Result, error) {
 	now := time.Now()
 	nowNano := now.UnixNano()
-	windowNano := int64(window.Nanoseconds())
+	windowNano := window.Nanoseconds()
 	ttlSec := int64(window.Seconds()) * 2 // Keep state for 2x window
 
 	// Max trackable requests (safety limit to prevent memory exhaustion)
@@ -156,7 +156,7 @@ func (sw *SlidingWindowAlgorithm) allowAtomic(ctx context.Context, store Store, 
 func (sw *SlidingWindowAlgorithm) allowNonAtomic(ctx context.Context, store Store, key string, limit int64, window time.Duration, n int64) (*Result, error) {
 	now := time.Now()
 	nowNano := now.UnixNano()
-	windowNano := int64(window.Nanoseconds())
+	windowNano := window.Nanoseconds()
 
 	// Get current state
 	state, err := sw.getState(ctx, store, key, limit, windowNano)
@@ -273,7 +273,7 @@ func (sw *SlidingWindowAlgorithm) Reset(ctx context.Context, store Store, key st
 
 // GetWindowInfo returns information about the current window state
 func (sw *SlidingWindowAlgorithm) GetWindowInfo(ctx context.Context, store Store, key string, limit int64, window time.Duration) (map[string]interface{}, error) {
-	windowNano := int64(window.Nanoseconds())
+	windowNano := window.Nanoseconds()
 	state, err := sw.getState(ctx, store, key, limit, windowNano)
 	if err != nil {
 		return nil, err
@@ -328,7 +328,7 @@ func (sw *SlidingWindowAlgorithm) GetWindowInfo(ctx context.Context, store Store
 
 // GetMetrics returns detailed metrics about the sliding window
 func (sw *SlidingWindowAlgorithm) GetMetrics(ctx context.Context, store Store, key string, limit int64, window time.Duration) (*WindowMetrics, error) {
-	windowNano := int64(window.Nanoseconds())
+	windowNano := window.Nanoseconds()
 	state, err := sw.getState(ctx, store, key, limit, windowNano)
 	if err != nil {
 		return nil, err
@@ -491,7 +491,7 @@ func (sw *SlidingWindowAlgorithm) cleanupExpiredRequests(state *SlidingWindowSta
 
 // GetRequestPattern analyzes the request pattern within the window
 func (sw *SlidingWindowAlgorithm) GetRequestPattern(ctx context.Context, store Store, key string, limit int64, window time.Duration) (*RequestPattern, error) {
-	windowNano := int64(window.Nanoseconds())
+	windowNano := window.Nanoseconds()
 	state, err := sw.getState(ctx, store, key, limit, windowNano)
 	if err != nil {
 		return nil, err

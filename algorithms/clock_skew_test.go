@@ -180,7 +180,7 @@ func TestSlidingWindow_CleanupRemovesFutureTimestamps(t *testing.T) {
 	// Create a state with mixed timestamps
 	now := time.Now()
 	nowNano := now.UnixNano()
-	windowNano := int64(time.Minute.Nanoseconds())
+	windowNano := time.Minute.Nanoseconds()
 
 	state := &SlidingWindowState{
 		Requests: []int64{
@@ -223,7 +223,7 @@ func TestSlidingWindow_CleanupOldAndFutureTimestamps(t *testing.T) {
 
 	now := time.Now()
 	nowNano := now.UnixNano()
-	windowNano := int64((30 * time.Second).Nanoseconds())
+	windowNano := (30 * time.Second).Nanoseconds()
 
 	state := &SlidingWindowState{
 		Requests: []int64{
@@ -271,7 +271,7 @@ func TestSlidingWindow_EmptyStateWithClockSkew(t *testing.T) {
 	algo := NewSlidingWindowAlgorithm()
 
 	nowNano := time.Now().UnixNano()
-	windowNano := int64(time.Minute.Nanoseconds())
+	windowNano := time.Minute.Nanoseconds()
 
 	state := &SlidingWindowState{
 		Requests:   []int64{}, // Empty
@@ -291,7 +291,7 @@ func TestSlidingWindow_AllFutureTimestamps(t *testing.T) {
 	algo := NewSlidingWindowAlgorithm()
 
 	nowNano := time.Now().UnixNano()
-	windowNano := int64(time.Minute.Nanoseconds())
+	windowNano := time.Minute.Nanoseconds()
 
 	state := &SlidingWindowState{
 		Requests: []int64{
@@ -315,7 +315,7 @@ func TestSlidingWindow_AllExpiredTimestamps(t *testing.T) {
 	algo := NewSlidingWindowAlgorithm()
 
 	nowNano := time.Now().UnixNano()
-	windowNano := int64((30 * time.Second).Nanoseconds())
+	windowNano := (30 * time.Second).Nanoseconds()
 
 	state := &SlidingWindowState{
 		Requests: []int64{

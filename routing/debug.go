@@ -30,17 +30,17 @@ type PatternAttempt struct {
 func (e *MatchExplanation) String() string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("=== Pattern Match Explanation for: %s ===\n", e.Path))
-	sb.WriteString(fmt.Sprintf("Result: %v\n", map[bool]string{true: "MATCHED", false: "NO MATCH"}[e.Success]))
+	fmt.Fprintf(&sb, "=== Pattern Match Explanation for: %s ===\n", e.Path)
+	fmt.Fprintf(&sb, "Result: %v\n", map[bool]string{true: "MATCHED", false: "NO MATCH"}[e.Success])
 
 	if e.Success {
-		sb.WriteString(fmt.Sprintf("Matched Pattern: %s (%s)\n", e.MatchedPattern.Pattern, e.MatchedPattern.MatchType))
-		sb.WriteString(fmt.Sprintf("Resolved Scope: %s\n", e.MatchedScope))
-		sb.WriteString(fmt.Sprintf("Priority: %d\n", e.MatchedPattern.Priority))
+		fmt.Fprintf(&sb, "Matched Pattern: %s (%s)\n", e.MatchedPattern.Pattern, e.MatchedPattern.MatchType)
+		fmt.Fprintf(&sb, "Resolved Scope: %s\n", e.MatchedScope)
+		fmt.Fprintf(&sb, "Priority: %d\n", e.MatchedPattern.Priority)
 	}
 
-	sb.WriteString(fmt.Sprintf("Total Duration: %v\n", e.TotalDuration))
-	sb.WriteString(fmt.Sprintf("\nPatterns Tried: %d\n", len(e.TriedPatterns)))
+	fmt.Fprintf(&sb, "Total Duration: %v\n", e.TotalDuration)
+	fmt.Fprintf(&sb, "\nPatterns Tried: %d\n", len(e.TriedPatterns))
 
 	for i, attempt := range e.TriedPatterns {
 		status := "❌ NO MATCH"
@@ -48,14 +48,14 @@ func (e *MatchExplanation) String() string {
 			status = "✅ MATCHED"
 		}
 
-		sb.WriteString(fmt.Sprintf("\n%d. %s [%s] (priority=%d)\n",
-			i+1, attempt.Pattern.Pattern, attempt.Pattern.MatchType, attempt.Pattern.Priority))
-		sb.WriteString(fmt.Sprintf("   Status: %s\n", status))
-		sb.WriteString(fmt.Sprintf("   Duration: %v\n", attempt.Duration))
-		sb.WriteString(fmt.Sprintf("   Reason: %s\n", attempt.Reason))
+		fmt.Fprintf(&sb, "\n%d. %s [%s] (priority=%d)\n",
+			i+1, attempt.Pattern.Pattern, attempt.Pattern.MatchType, attempt.Pattern.Priority)
+		fmt.Fprintf(&sb, "   Status: %s\n", status)
+		fmt.Fprintf(&sb, "   Duration: %v\n", attempt.Duration)
+		fmt.Fprintf(&sb, "   Reason: %s\n", attempt.Reason)
 
 		if attempt.Matched {
-			sb.WriteString(fmt.Sprintf("   → Resolved to scope: %s\n", attempt.Pattern.Scope))
+			fmt.Fprintf(&sb, "   → Resolved to scope: %s\n", attempt.Pattern.Scope)
 			break // Stop after first match
 		}
 	}
@@ -213,12 +213,12 @@ func (i *InspectResolver) String() string {
 	var sb strings.Builder
 
 	sb.WriteString("=== Route Resolver Configuration ===\n")
-	sb.WriteString(fmt.Sprintf("Total Patterns: %d\n", i.TotalPatterns))
-	sb.WriteString(fmt.Sprintf("  Exact:  %d\n", i.ExactPatterns))
-	sb.WriteString(fmt.Sprintf("  Prefix: %d\n", i.PrefixPatterns))
-	sb.WriteString(fmt.Sprintf("  Glob:   %d\n", i.GlobPatterns))
-	sb.WriteString(fmt.Sprintf("  Regex:  %d\n", i.RegexPatterns))
-	sb.WriteString(fmt.Sprintf("\nUnique Scopes: %d\n", len(i.UniqueScopes)))
+	fmt.Fprintf(&sb, "Total Patterns: %d\n", i.TotalPatterns)
+	fmt.Fprintf(&sb, "  Exact:  %d\n", i.ExactPatterns)
+	fmt.Fprintf(&sb, "  Prefix: %d\n", i.PrefixPatterns)
+	fmt.Fprintf(&sb, "  Glob:   %d\n", i.GlobPatterns)
+	fmt.Fprintf(&sb, "  Regex:  %d\n", i.RegexPatterns)
+	fmt.Fprintf(&sb, "\nUnique Scopes: %d\n", len(i.UniqueScopes))
 	for _, scope := range i.UniqueScopes {
 		count := 0
 		for _, p := range i.Patterns {
@@ -226,9 +226,9 @@ func (i *InspectResolver) String() string {
 				count++
 			}
 		}
-		sb.WriteString(fmt.Sprintf("  - %s (%d patterns)\n", scope, count))
+		fmt.Fprintf(&sb, "  - %s (%d patterns)\n", scope, count)
 	}
-	sb.WriteString(fmt.Sprintf("\nPriority Range: %d - %d\n", i.PriorityRange[0], i.PriorityRange[1]))
+	fmt.Fprintf(&sb, "\nPriority Range: %d - %d\n", i.PriorityRange[0], i.PriorityRange[1])
 
 	return sb.String()
 }

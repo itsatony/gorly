@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/itsatony/gorly"
+	ratelimit "github.com/itsatony/gorly"
 	"github.com/itsatony/gorly/routing"
 	"github.com/itsatony/gorly/stores"
 )
@@ -209,7 +209,7 @@ func (m *HTTPMiddleware) Middleware(next http.Handler) http.Handler {
 
 // MiddlewareFunc returns the HTTP middleware function for use with mux.Router.Use()
 func (m *HTTPMiddleware) MiddlewareFunc(next http.HandlerFunc) http.HandlerFunc {
-	return m.Middleware(http.HandlerFunc(next)).ServeHTTP
+	return m.Middleware(next).ServeHTTP
 }
 
 // shouldSkipPath checks if the path should skip rate limiting
@@ -250,9 +250,9 @@ func (m *HTTPMiddleware) handleRateLimit(w http.ResponseWriter, r *http.Request,
 
 		if m.config.CustomResponse.Body != nil {
 			if bodyBytes, ok := m.config.CustomResponse.Body.([]byte); ok {
-				w.Write(bodyBytes)
+				_, _ = w.Write(bodyBytes)
 			} else {
-				json.NewEncoder(w).Encode(m.config.CustomResponse.Body)
+				_ = json.NewEncoder(w).Encode(m.config.CustomResponse.Body)
 			}
 		}
 		return
@@ -269,7 +269,7 @@ func (m *HTTPMiddleware) handleRateLimit(w http.ResponseWriter, r *http.Request,
 		"retry_after": result.RetryAfter.Seconds(),
 	}
 
-	json.NewEncoder(w).Encode(response)
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 // DefaultIPContextExtractor extracts context based on IP address
@@ -465,13 +465,11 @@ func NewSecureHTTPErrorHandler(formatter ErrorFormatter) HTTPErrorHandler {
 		w.WriteHeader(http.StatusServiceUnavailable) // 503 instead of 500 for rate limiting issues
 
 		// Determine error type based on context
-		errorType := ErrorTypeInternal
+		// We have a result but got an error: a rate limiting error. Without a
+		// result it is most likely an extraction error.
+		errorType := ErrorTypeRateLimit
 		if result == nil {
-			// If we don't have a result, it's likely an extraction error
 			errorType = ErrorTypeExtraction
-		} else {
-			// We have a result but got an error, so it's a rate limiting error
-			errorType = ErrorTypeRateLimit
 		}
 
 		// Format error safely - never expose internal details
@@ -481,7 +479,7 @@ func NewSecureHTTPErrorHandler(formatter ErrorFormatter) HTTPErrorHandler {
 			"error": safeMessage,
 		}
 
-		json.NewEncoder(w).Encode(response)
+		_ = json.NewEncoder(w).Encode(response)
 	}
 }
 

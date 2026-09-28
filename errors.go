@@ -215,7 +215,7 @@ func addMetadata(err *cuserr.CustomError, keyValues ...interface{}) {
 		value := keyValues[i+1]
 		// WithMetadata expects string values, so convert to string
 		valueStr := fmt.Sprintf("%v", value)
-		err.WithMetadata(key, valueStr)
+		_ = err.WithMetadata(key, valueStr)
 	}
 }
 

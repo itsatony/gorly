@@ -505,7 +505,7 @@ func (rc *ResolverConfig) Validate() error {
 			return WrapConfigError(err, "invalid entity ID in overrides")
 		}
 
-		if overrides == nil || len(overrides) == 0 {
+		if len(overrides) == 0 {
 			return WrapConfigError(nil, "entity has no overrides",
 				"entity", entityID,
 				"recommendation", "remove empty entity override entries")

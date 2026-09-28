@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/itsatony/gorly"
+	ratelimit "github.com/itsatony/gorly"
 	"github.com/itsatony/gorly/stores"
 )
 

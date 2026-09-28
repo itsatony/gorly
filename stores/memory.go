@@ -8,8 +8,9 @@ import (
 	"sync"
 	"time"
 
-	ratelimit "github.com/itsatony/gorly"
 	nuts "github.com/vaudience/go-nuts"
+
+	ratelimit "github.com/itsatony/gorly"
 )
 
 // ============================================================================
@@ -76,12 +77,6 @@ type shard struct {
 	expires map[string]time.Time
 }
 
-// entry represents a stored value with metadata
-type entry struct {
-	Value     []byte    `json:"value"`
-	ExpiresAt time.Time `json:"expires_at"`
-}
-
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
@@ -105,7 +100,7 @@ type MemoryStoreConfig struct {
 // DefaultMemoryStoreConfig returns default configuration
 func DefaultMemoryStoreConfig() *MemoryStoreConfig {
 	return &MemoryStoreConfig{
-		ShardCount:      int(ratelimit.DefaultShardCount),
+		ShardCount:      ratelimit.DefaultShardCount,
 		CleanupInterval: time.Duration(ratelimit.DefaultCleanupIntervalSeconds) * time.Second,
 		MaxKeys:         int(ratelimit.DefaultMaxKeys),
 		Logger:          ratelimit.NewNopLogger(),
@@ -277,7 +272,7 @@ func (ms *MemoryStore) IncrementBy(ctx context.Context, key string, amount int64
 	if data, exists := shard.data[key]; exists {
 		// Decode int64 from binary (8 bytes, big-endian)
 		if len(data) >= 8 {
-			current = int64(binary.BigEndian.Uint64(data))
+			current = int64(binary.BigEndian.Uint64(data)) //nolint:gosec // G115: two's-complement round trip of an int64 we stored
 		} else {
 			// Fallback to JSON for backward compatibility (if data was stored as JSON)
 			if err := json.Unmarshal(data, &current); err != nil {
@@ -292,7 +287,7 @@ func (ms *MemoryStore) IncrementBy(ctx context.Context, key string, amount int64
 
 	// Store new value using binary encoding (8 bytes for int64)
 	data := make([]byte, 8)
-	binary.BigEndian.PutUint64(data, uint64(current))
+	binary.BigEndian.PutUint64(data, uint64(current)) //nolint:gosec // G115: two's-complement encoding, decoded back to int64
 	shard.data[key] = data
 
 	// Update expiration
@@ -402,7 +397,7 @@ func (ms *MemoryStore) getShard(key string) *shard {
 	for i := 0; i < len(key); i++ {
 		hash = hash*31 + uint32(key[i])
 	}
-	return ms.shards[hash%uint32(ms.shardCount)]
+	return ms.shards[hash%uint32(ms.shardCount)] //nolint:gosec // G115: shardCount is a small positive config value
 }
 
 // checkClosed checks if the store is closed
