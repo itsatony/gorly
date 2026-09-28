@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-09-28
+
+### Added - Managed Redis: ACL user, TLS, caller-owned client (gorly#1)
+
+- `RedisStoreConfig.Username` — the Redis 6+ ACL user sent with `AUTH`. Managed
+  Redis offerings that enforce ACLs refuse a password-only `AUTH` (`WRONGPASS`).
+- `RedisStoreConfig.TLSConfig *tls.Config` — non-nil enables TLS. Cloned at
+  construction, so later mutation by the caller has no effect. Pinning a CN-only,
+  SAN-less self-signed certificate is supported through `VerifyConnection`.
+  ⛔ `Validate` refuses `InsecureSkipVerify` without a `VerifyConnection` or
+  `VerifyPeerCertificate` — that combination accepts any certificate.
+- `stores.NewRedisStoreFromClient(client redis.UniversalClient, config)` — build the
+  store on a client the caller already owns (its TLS, ACL user, pool, hooks), so
+  the limiter cannot open a weaker connection than the rest of the service. The
+  store **never closes** a caller-owned client; `Close` only marks the store closed.
+  Only store-level config fields apply (`KeyPrefix`, `Logger`, `Retry*`,
+  `DialTimeout` as the ping timeout); the caller's config struct is not mutated,
+  and zero `Retry*Backoff`/multiplier fields take the defaults when retries are on.
+- `scripts/setup-redis-secure.sh` / `cleanup-redis-secure.sh`: Podman Redis instances
+  (ACL-only; TLS-only + ACL-only with a CN-only SAN-less cert) for the new live
+  tests in `stores/redis_acl_tls_test.go` (skipped when the env is absent).
+
+### Fixed
+- `NewRedisStore` now closes the client it built when the startup ping fails
+  (previously its pool leaked on a failed boot).
+- README Redis examples used field names that do not exist (`Addr`, `DB`,
+  `MinRetryBackoff`, `MaxRetryBackoff`) and documented a `TLSConfig` field that did
+  not exist until this release; rewritten against the real struct.
+
+### Compatibility
+Additive. Defaults are unchanged: no `Username` and nil `TLSConfig` behave exactly
+as in v1.2.0. `RedisStoreStats.Address`/`Database` now report the client's actual
+values (identical for `NewRedisStore`).
+
 ## [1.2.0] - 2025-11-02
 
 ### ✨ Added - Advanced Pattern-Based Routing

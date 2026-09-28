@@ -202,15 +202,10 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 import "github.com/itsatony/gorly/stores"
 
 // Create Redis store (shared across all instances)
-store, err := stores.NewRedisStore(&stores.RedisStoreConfig{
-    Addr:         "redis:6379",
-    Password:     os.Getenv("REDIS_PASSWORD"),
-    DB:           0,
-    MaxRetries:   3,
-    DialTimeout:  5 * time.Second,
-    ReadTimeout:  3 * time.Second,
-    WriteTimeout: 3 * time.Second,
-})
+cfg := stores.DefaultRedisStoreConfig() // start from defaults: a partial literal fails Validate (PoolSize 0)
+cfg.Address = "redis:6379"
+cfg.Password = os.Getenv("REDIS_PASSWORD")
+store, err := stores.NewRedisStore(cfg)
 if err != nil {
     log.Fatal(err)
 }
@@ -609,29 +604,49 @@ store, err := stores.NewMemoryStore(&stores.MemoryStoreConfig{
 ### Redis Store (Production)
 
 ```go
-store, err := stores.NewRedisStore(&stores.RedisStoreConfig{
-    Addr:            "localhost:6379",
-    Password:        "your-password",
-    DB:              0,
-
-    // Connection pool settings
-    PoolSize:        10,
-    MinIdleConns:    2,
-
-    // Timeout settings
-    DialTimeout:     5 * time.Second,
-    ReadTimeout:     3 * time.Second,
-    WriteTimeout:    3 * time.Second,
-
-    // Reliability settings
-    MaxRetries:      3,
-    MinRetryBackoff: 8 * time.Millisecond,
-    MaxRetryBackoff: 512 * time.Millisecond,
-
-    // TLS configuration (for production)
-    TLSConfig:       &tls.Config{...},
-})
+cfg := stores.DefaultRedisStoreConfig() // defaults for pool, timeouts, retries, KeyPrefix
+cfg.Address = "localhost:6379"
+cfg.Password = "your-password"
+cfg.Database = 0
+cfg.PoolSize = 10
+cfg.MinIdleConns = 2
+cfg.DialTimeout = 5 * time.Second
+store, err := stores.NewRedisStore(cfg)
 ```
+
+#### Managed Redis: ACL user + TLS (v1.3.0+)
+
+A managed Redis that enforces ACLs refuses a password-only `AUTH` (`WRONGPASS`);
+send the ACL user. `TLSConfig` non-nil enables TLS (it is cloned at construction):
+
+```go
+cfg := stores.DefaultRedisStoreConfig()
+cfg.Address = "redis.example.internal:6379"
+cfg.Username = "my-acl-user"
+cfg.Password = os.Getenv("REDIS_PASSWORD")
+cfg.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}
+store, err := stores.NewRedisStore(cfg)
+```
+
+⚠ A self-signed, CN-only certificate without a SAN cannot pass Go's hostname
+check. Pin it instead: `InsecureSkipVerify: true` **together with** a
+`VerifyConnection` that verifies the peer chain against the pinned PEM
+(`x509.Certificate.Verify` with `Roots` and no `DNSName`) — `InsecureSkipVerify`
+alone verifies nothing. See `pinnedTLSConfig` in `stores/redis_acl_tls_test.go`.
+
+#### Reusing your own client (recommended when you already have one)
+
+```go
+client := redis.NewClient(&redis.Options{ /* your TLS, ACL user, pool, hooks */ })
+store, err := stores.NewRedisStoreFromClient(client, nil) // or a config for KeyPrefix/Logger/Retry*
+defer client.Close()  // the caller owns the client
+defer store.Close()   // marks the store closed; never closes client
+```
+
+Any `redis.UniversalClient` is accepted. Only the store-level config fields apply
+(`KeyPrefix`, `Logger`, `Retry*`, `DialTimeout` as the startup-ping timeout);
+connection fields belong to the client and are ignored. One client factory means
+the limiter can never open a weaker connection than the rest of the service.
 
 **Pros**:
 - Distributed rate limiting across multiple instances
@@ -816,13 +831,13 @@ store, _ := stores.NewMemoryStore(&stores.MemoryStoreConfig{
 
 **Redis Store**:
 ```go
-store, _ := stores.NewRedisStore(&stores.RedisStoreConfig{
-    PoolSize:        100,                  // Higher pool for high concurrency
-    MinIdleConns:    10,                   // Keep connections warm
-    ReadTimeout:     100 * time.Millisecond,  // Aggressive timeout
-    WriteTimeout:    100 * time.Millisecond,
-    MaxRetries:      2,                    // Fail fast
-})
+cfg := stores.DefaultRedisStoreConfig()
+cfg.PoolSize = 100                          // Higher pool for high concurrency
+cfg.MinIdleConns = 10                       // Keep connections warm
+cfg.ReadTimeout = 100 * time.Millisecond    // Aggressive timeout
+cfg.WriteTimeout = 100 * time.Millisecond
+cfg.MaxRetries = 2                          // Fail fast
+store, _ := stores.NewRedisStore(cfg)
 ```
 
 ## Testing

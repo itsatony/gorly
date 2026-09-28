@@ -2,6 +2,7 @@ package stores
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"sync"
 	"time"
@@ -18,14 +19,20 @@ import (
 // RedisStore implements Store interface using Redis as the backend
 // Thread-safe with automatic connection pooling and health checks
 type RedisStore struct {
-	client    *redis.Client
-	config    *RedisStoreConfig
-	closed    bool
-	closeMu   sync.RWMutex
-	logger    ratelimit.Logger
-	id        string
-	healthMu  sync.RWMutex
-	lastError error
+	client redis.UniversalClient
+	config *RedisStoreConfig
+	// ownsClient is true when the store built the client (NewRedisStore) and
+	// therefore closes it in Close. A client handed in via
+	// NewRedisStoreFromClient belongs to the caller and is never closed here.
+	ownsClient bool
+	address    string
+	database   int
+	closed     bool
+	closeMu    sync.RWMutex
+	logger     ratelimit.Logger
+	id         string
+	healthMu   sync.RWMutex
+	lastError  error
 }
 
 // ============================================================================
@@ -37,8 +44,22 @@ type RedisStoreConfig struct {
 	// Address is the Redis server address (host:port)
 	Address string
 
+	// Username is the Redis 6+ ACL user sent with AUTH (optional). When empty,
+	// a password-only AUTH is sent (the "default" user), exactly as before.
+	// Managed Redis offerings that enforce ACLs refuse a password-only AUTH.
+	Username string
+
 	// Password for Redis authentication (optional)
 	Password string
+
+	// TLSConfig enables TLS when non-nil. It is cloned at construction, so
+	// later mutation by the caller has no effect on the store. When ServerName
+	// is empty, crypto/tls derives it from Address. To pin a certificate that
+	// carries no usable hostname (e.g. a CN-only, SAN-less self-signed cert),
+	// set InsecureSkipVerify together with a VerifyConnection that checks the
+	// chain against the pinned CA — InsecureSkipVerify alone verifies nothing.
+	// nil (the default) keeps a plaintext connection, as before.
+	TLSConfig *tls.Config
 
 	// Database to use (0-15)
 	Database int
@@ -145,6 +166,19 @@ func (c *RedisStoreConfig) Validate() error {
 		return ratelimit.WrapConfigError(nil, "Dial timeout must be at least 1 second",
 			"dial_timeout", c.DialTimeout)
 	}
+	return validateTLSConfig(c.TLSConfig)
+}
+
+// validateTLSConfig refuses a TLS config that would verify nothing:
+// InsecureSkipVerify with neither VerifyConnection nor VerifyPeerCertificate
+// accepts ANY certificate, i.e. TLS without authentication. Pinning (skip the
+// hostname check, verify the chain yourself) must say so with a verifier.
+func validateTLSConfig(tc *tls.Config) error {
+	if tc != nil && tc.InsecureSkipVerify && tc.VerifyConnection == nil && tc.VerifyPeerCertificate == nil {
+		return ratelimit.WrapConfigError(nil,
+			"TLS InsecureSkipVerify requires VerifyConnection or VerifyPeerCertificate (pin the certificate)",
+			"tls_insecure_skip_verify", true)
+	}
 	return nil
 }
 
@@ -152,7 +186,8 @@ func (c *RedisStoreConfig) Validate() error {
 // CONSTRUCTOR
 // ============================================================================
 
-// NewRedisStore creates a new Redis store with connection pooling
+// NewRedisStore creates a new Redis store with connection pooling. The store
+// owns the client it builds and closes it in Close.
 func NewRedisStore(config *RedisStoreConfig) (*RedisStore, error) {
 	if config == nil {
 		config = DefaultRedisStoreConfig()
@@ -162,11 +197,18 @@ func NewRedisStore(config *RedisStoreConfig) (*RedisStore, error) {
 		return nil, err
 	}
 
+	var tlsConfig *tls.Config
+	if config.TLSConfig != nil {
+		tlsConfig = config.TLSConfig.Clone()
+	}
+
 	// Create Redis client with connection pooling
 	client := redis.NewClient(&redis.Options{
 		Addr:         config.Address,
+		Username:     config.Username,
 		Password:     config.Password,
 		DB:           config.Database,
+		TLSConfig:    tlsConfig,
 		PoolSize:     config.PoolSize,
 		MinIdleConns: config.MinIdleConns,
 		MaxRetries:   config.MaxRetries,
@@ -179,20 +221,19 @@ func NewRedisStore(config *RedisStoreConfig) (*RedisStore, error) {
 	})
 
 	rs := &RedisStore{
-		client: client,
-		config: config,
-		logger: config.Logger,
-		id:     nuts.NID(ratelimit.IDPrefixRateLimiter, 16),
+		client:     client,
+		config:     config,
+		ownsClient: true,
+		address:    config.Address,
+		database:   config.Database,
+		logger:     config.Logger,
+		id:         nuts.NID(ratelimit.IDPrefixRateLimiter, 16),
 	}
 
-	// Test connection
-	ctx, cancel := context.WithTimeout(context.Background(), config.DialTimeout)
-	defer cancel()
-
-	if err := client.Ping(ctx).Err(); err != nil {
-		return nil, ratelimit.WrapStorageError(err, "redis connection failed",
-			"address", config.Address,
-			"database", config.Database)
+	if err := rs.ping(config.DialTimeout); err != nil {
+		// The store built this client; do not leak its pool on a failed boot.
+		_ = client.Close()
+		return nil, err
 	}
 
 	rs.logger.Info("redis store created",
@@ -200,9 +241,110 @@ func NewRedisStore(config *RedisStoreConfig) (*RedisStore, error) {
 		"address", config.Address,
 		"database", config.Database,
 		"pool_size", config.PoolSize,
+		"tls", tlsConfig != nil,
+		"acl_user", config.Username != "",
 	)
 
 	return rs, nil
+}
+
+// NewRedisStoreFromClient creates a store on top of a client the CALLER built
+// and owns — the way to reuse one client factory (TLS, ACL user, pool, hooks)
+// so the rate limiter can never open a weaker connection than the rest of the
+// service. The store never closes client: Close only marks the store closed.
+//
+// config is optional (nil = DefaultRedisStoreConfig()). Only the store-level
+// fields apply — KeyPrefix, Logger, the Retry* fields and DialTimeout (as the
+// startup-ping timeout). The connection fields (Address, Username, Password,
+// Database, TLSConfig, pool sizes and socket timeouts) belong to the client and
+// are ignored. The client is pinged once; construction fails if it is
+// unreachable.
+//
+// ⚠ With a *redis.ClusterClient, Scan walks only the node it lands on and
+// multi-key scripts must keep their keys in one hash slot.
+func NewRedisStoreFromClient(client redis.UniversalClient, config *RedisStoreConfig) (*RedisStore, error) {
+	if client == nil {
+		return nil, ratelimit.WrapConfigError(nil, "Redis client is required",
+			"client", nil)
+	}
+	if config == nil {
+		config = DefaultRedisStoreConfig()
+	} else {
+		// Copy: the store must not write defaults into the caller's struct.
+		cfg := *config
+		config = &cfg
+	}
+	if config.Logger == nil {
+		config.Logger = ratelimit.NewNopLogger()
+	}
+	if config.DialTimeout <= 0 {
+		config.DialTimeout = DefaultRedisStoreConfig().DialTimeout
+	}
+	if config.RetryMaxAttempts < 0 {
+		return nil, ratelimit.WrapConfigError(nil, "Retry max attempts cannot be negative",
+			"retry_max_attempts", config.RetryMaxAttempts)
+	}
+	if config.RetryMaxAttempts > 0 {
+		// Zero means "unset" for a partial literal: take the defaults rather
+		// than retrying in a zero-backoff loop.
+		def := DefaultRedisStoreConfig()
+		if config.RetryInitialBackoff <= 0 {
+			config.RetryInitialBackoff = def.RetryInitialBackoff
+		}
+		if config.RetryMaxBackoff <= 0 {
+			config.RetryMaxBackoff = def.RetryMaxBackoff
+		}
+		if config.RetryBackoffMultiplier < 1 {
+			config.RetryBackoffMultiplier = def.RetryBackoffMultiplier
+		}
+	}
+
+	address, database := describeClient(client)
+	// Stats/String read the store's own fields, not the ignored config ones.
+	rs := &RedisStore{
+		client:     client,
+		config:     config,
+		ownsClient: false,
+		address:    address,
+		database:   database,
+		logger:     config.Logger,
+		id:         nuts.NID(ratelimit.IDPrefixRateLimiter, 16),
+	}
+
+	if err := rs.ping(config.DialTimeout); err != nil {
+		return nil, err
+	}
+
+	rs.logger.Info("redis store created from caller-owned client",
+		"id", rs.id,
+		"address", address,
+		"database", database,
+	)
+
+	return rs, nil
+}
+
+// describeClient reports the address and database of a client for Stats and
+// logs. Only *redis.Client exposes both; other UniversalClients report "" / 0.
+func describeClient(client redis.UniversalClient) (string, int) {
+	if c, ok := client.(*redis.Client); ok {
+		opts := c.Options()
+		return opts.Addr, opts.DB
+	}
+	return "", 0
+}
+
+// ping verifies connectivity once at construction.
+func (rs *RedisStore) ping(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := rs.client.Ping(ctx).Err(); err != nil {
+		return ratelimit.WrapStorageError(err, "redis connection failed",
+			"address", rs.address,
+			"database", rs.database)
+	}
+	return nil
 }
 
 // ============================================================================
@@ -492,6 +634,12 @@ func (rs *RedisStore) Close() error {
 
 	rs.closed = true
 
+	// A caller-owned client (NewRedisStoreFromClient) is the caller's to close.
+	if !rs.ownsClient {
+		rs.logger.Info("redis store closed (caller-owned client left open)", "id", rs.id)
+		return nil
+	}
+
 	// Close Redis client
 	if err := rs.client.Close(); err != nil {
 		rs.logger.Warn("error closing redis client",
@@ -720,8 +868,8 @@ func (rs *RedisStore) Stats() *RedisStoreStats {
 
 	stats := &RedisStoreStats{
 		ID:       rs.id,
-		Address:  rs.config.Address,
-		Database: rs.config.Database,
+		Address:  rs.address,
+		Database: rs.database,
 		Closed:   rs.closed,
 	}
 
