@@ -120,7 +120,11 @@ jobs:
     - name: Install Gosec
       run: go install github.com/securego/gosec/v2/cmd/gosec@latest
 
-    - name: Run Gosec Security Scanner
+    # ⛔ The BLOCKING security gate is the `gosec` linter inside golangci-lint
+    # (lint job, .golangci.yml: excluded only for _test.go and examples/), which
+    # honours the reviewed //nolint:gosec directives. This job only produces the
+    # SARIF report for code scanning, which is why -no-fail is confined to it.
+    - name: Gosec SARIF report (informational; gating is golangci-lint gosec)
       run: gosec -no-fail -fmt sarif -out gosec.sarif ./...
 
     - name: Upload SARIF file

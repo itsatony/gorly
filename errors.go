@@ -56,6 +56,10 @@ var (
 	// ErrScriptNotSupported indicates the store doesn't support script execution
 	ErrScriptNotSupported = errors.New(ErrMsgScriptNotSupported)
 
+	// ErrOperationNotSupported indicates the store refuses the operation in its
+	// current mode (not a configuration error: the config is valid).
+	ErrOperationNotSupported = errors.New(ErrMsgOperationNotSupported)
+
 	// ErrKeyTooLong indicates the key exceeds maximum allowed length
 	ErrKeyTooLong = errors.New(ErrMsgKeyTooLong)
 )
@@ -90,6 +94,14 @@ func WrapContextError(err error, message string, keyValues ...interface{}) error
 	}
 
 	cusErr := cuserr.NewCustomError(ErrInvalidContext, err, message)
+	addMetadata(cusErr, keyValues...)
+	return cusErr
+}
+
+// WrapNotSupportedError reports an operation the store refuses in its current
+// mode. errors.Is(err, ErrOperationNotSupported) holds.
+func WrapNotSupportedError(message string, keyValues ...interface{}) error {
+	cusErr := cuserr.NewCustomError(ErrOperationNotSupported, nil, message)
 	addMetadata(cusErr, keyValues...)
 	return cusErr
 }

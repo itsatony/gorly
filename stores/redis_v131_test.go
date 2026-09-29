@@ -195,7 +195,8 @@ func TestFlushDB_RefusedOnCallerOwnedClient(t *testing.T) {
 	rs := &RedisStore{client: client, config: DefaultRedisStoreConfig(), ownsClient: false, logger: ratelimit.NewNopLogger()}
 	err := rs.FlushDB(context.Background())
 	aclErr(t, err)
-	aclTrue(t, ratelimit.IsConfigError(err), "want config error, got %v", err)
+	aclTrue(t, errors.Is(err, ratelimit.ErrOperationNotSupported), "want ErrOperationNotSupported, got %v", err)
+	aclTrue(t, !ratelimit.IsConfigError(err), "not a config error: %v", err)
 }
 
 func TestNewRedisStoreFromClient_RefusesShortDialTimeout(t *testing.T) {

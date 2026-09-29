@@ -247,6 +247,10 @@ const (
 	// ErrMsgScriptNotSupported is returned when store doesn't support script execution
 	ErrMsgScriptNotSupported = "script execution not supported by this store"
 
+	// ErrMsgOperationNotSupported is returned when a store refuses an operation
+	// in its current mode (e.g. FlushDB on a caller-owned Redis client).
+	ErrMsgOperationNotSupported = "operation not supported by this store"
+
 	// ErrMsgKeyTooLong is returned when key exceeds maximum length
 	ErrMsgKeyTooLong = "key length exceeds maximum allowed"
 )
