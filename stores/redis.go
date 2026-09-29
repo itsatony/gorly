@@ -199,9 +199,13 @@ func validateTLSConfig(tc *tls.Config) error {
 		return ratelimit.WrapConfigError(nil, "TLS MinVersion below TLS 1.2 is not allowed",
 			"tls_min_version", tc.MinVersion)
 	}
-	if tc != nil && tc.InsecureSkipVerify && tc.VerifyConnection == nil && tc.VerifyPeerCertificate == nil {
+	// InsecureSkipVerify turns the default verification off, so something must
+	// replace it on EVERY handshake. Only VerifyConnection runs on resumed
+	// sessions; VerifyPeerCertificate is skipped for them, so a config relying
+	// on it alone accepts any resumed session unverified (v1.3.2).
+	if tc != nil && tc.InsecureSkipVerify && tc.VerifyConnection == nil {
 		return ratelimit.WrapConfigError(nil,
-			"TLS InsecureSkipVerify requires VerifyConnection or VerifyPeerCertificate (pin the certificate)",
+			"TLS InsecureSkipVerify requires VerifyConnection (VerifyPeerCertificate is not called on resumed sessions); use PinnedLeafTLSConfig",
 			"tls_insecure_skip_verify", true)
 	}
 	return nil
@@ -343,6 +347,7 @@ func NewRedisStoreFromClient(client redis.UniversalClient, config *RedisStoreCon
 	}
 
 	address, database := describeClient(client)
+	plaintextPassword := clientSendsPlaintextPassword(client)
 	// Stats/String read the store's own fields, not the ignored config ones.
 	rs := &RedisStore{
 		client:     client,
@@ -352,6 +357,12 @@ func NewRedisStoreFromClient(client redis.UniversalClient, config *RedisStoreCon
 		database:   database,
 		logger:     config.Logger,
 		id:         nuts.NID(ratelimit.IDPrefixRateLimiter, 16),
+	}
+
+	if plaintextPassword {
+		rs.logger.Warn("redis store authenticates over PLAINTEXT: the password crosses the network unencrypted; set TLSConfig",
+			"id", rs.id,
+			"address", address)
 	}
 
 	if ignoredConnFields {
@@ -381,6 +392,17 @@ func describeClient(client redis.UniversalClient) (string, int) {
 		return opts.Addr, opts.DB
 	}
 	return "", 0
+}
+
+// clientSendsPlaintextPassword reports a *redis.Client configured with a
+// password and no TLS. Other client kinds are not inspected.
+func clientSendsPlaintextPassword(client redis.UniversalClient) bool {
+	c, ok := client.(*redis.Client)
+	if !ok {
+		return false
+	}
+	opts := c.Options()
+	return opts.Password != "" && opts.TLSConfig == nil
 }
 
 // ping verifies connectivity once at construction.
@@ -1170,7 +1192,7 @@ func (rs *RedisStore) FlushDB(ctx context.Context) error {
 		return err
 	}
 	if !rs.ownsClient {
-		return ratelimit.WrapConfigError(nil,
+		return ratelimit.WrapNotSupportedError(
 			"FlushDB is not supported on a caller-owned client (it would wipe the whole shared database)",
 			"owns_client", false)
 	}

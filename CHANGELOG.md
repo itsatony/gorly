@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] - 2026-09-29
+
+Independent-review follow-up to 1.3.1 (gorly#1).
+
+### ⚠ Behaviour changes (1.3.1 and 1.3.2) — read before upgrading from 1.3.0
+- **1.3.1:** `NewRedisStoreFromClient` refuses a `DialTimeout` below 1s (1.3.0
+  silently accepted it); an empty `KeyPrefix` is forced to `gorly:` (existing
+  unprefixed counters are orphaned once — limits reset for one window, and an
+  unprefixed layout can no longer be chosen); `FlushDB` on a caller-owned client
+  is refused.
+- **1.3.2:** `TLSConfig` with `InsecureSkipVerify` now REQUIRES `VerifyConnection`.
+  A `VerifyPeerCertificate`-only config is refused: crypto/tls does not call it on
+  a resumed session, so with a `ClientSessionCache` resumed connections were not
+  verified at all. `PinnedLeafTLSConfig` already used `VerifyConnection`.
+- **1.3.2:** `PinnedLeafTLSConfig` refuses a pin file holding anything but
+  CERTIFICATE blocks (a private key, other PEM types, leading/trailing non-PEM
+  bytes, a truncated paste); it used to skip them silently.
+- **1.3.2:** `FlushDB`'s refusal is a dedicated `ErrOperationNotSupported`
+  (`errors.Is`), no longer a config error — the configuration is valid.
+
+### Added
+- `ParsePinnedLeaves(pem)` — the strict parser, returning the certificates so a
+  caller can log `NotAfter` (a pinned leaf's expiry takes every replica down at
+  once) or inspect `IsCA`.
+- `PinnedLeafTLSConfigWithOptions(pem, PinnedLeafOptions{RefuseCA: true})` —
+  refuses a CA certificate supplied where the server's LEAF belongs (opt-in,
+  because a default `openssl req -x509` self-signed server cert is CA:TRUE).
+- `ErrOperationNotSupported` / `WrapNotSupportedError`.
+- The plaintext-password WARN also fires for `NewRedisStoreFromClient` when the
+  `*redis.Client` has a password and no TLS.
+
+### CI
+- The blocking security gate is stated: golangci-lint's `gosec` (lint job); the
+  standalone gosec job only emits the SARIF report (`-no-fail` confined to it).
+
 ## [1.3.1] - 2026-09-28
 
 Review follow-up to 1.3.0 (gorly#1). No API removal; two refusals are new (see ⚠).
